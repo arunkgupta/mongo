@@ -1,6 +1,6 @@
 // dumprestore_helpers.js
 
-load( './jstests/multiVersion/libs/verify_collection_data.js' )
+load('./jstests/multiVersion/libs/verify_collection_data.js');
 
 // Given a "test spec" object, runs the specified test.
 //
@@ -13,7 +13,7 @@ load( './jstests/multiVersion/libs/verify_collection_data.js' )
 //     'mongoRestoreVersion' : "latest",
 //     'dumpDir' : dumpDir,
 //     'testDbpath' : testDbpath,
-//     'dumpType' : "direct",
+//     'dumpType' : "mongos",
 //     'restoreType' : "mongod" // "mongos" also supported
 // }
 //
@@ -21,16 +21,13 @@ load( './jstests/multiVersion/libs/verify_collection_data.js' )
 //
 // The "dumpDir" field is the external directory to use as scratch space for database dumps.
 //
-// The "testDbpath" is the external directory to use as the server dbpath directory.  This is also
-// used for the "direct" dump and restore.
+// The "testDbpath" is the external directory to use as the server dbpath directory.
 //
 // For the "dumpType" and "restoreType" fields, the following values are supported:
 //     - "mongod" - Do the dump or restore by connecting to a single mongod node
-//     - "direct" - Do the dump or restore directly from the data files
 //     - "mongos" - Do the dump or restore by connecting to a sharded cluster
 //
 function multiVersionDumpRestoreTest(configObj) {
-
     // First sanity check the arguments in our configObj
     var requiredKeys = [
         'serverSourceVersion',
@@ -41,7 +38,7 @@ function multiVersionDumpRestoreTest(configObj) {
         'testDbpath',
         'dumpType',
         'restoreType'
-    ]
+    ];
 
     var i;
 
@@ -54,26 +51,23 @@ function multiVersionDumpRestoreTest(configObj) {
     resetDbpath(configObj.testDbpath);
     if (configObj.dumpType === "mongos") {
         var shardingTestConfig = {
-            name : testBaseName + "_sharded_source",
-            mongos : [{ binVersion : configObj.serverSourceVersion }],
-            shards : [{ binVersion : configObj.serverSourceVersion,
-                        setParameter : "textSearchEnabled=true" }],
-            config : [{ binVersion : configObj.serverSourceVersion }]
-        }
+            name: testBaseName + "_sharded_source",
+            mongos: [{binVersion: configObj.serverSourceVersion}],
+            shards: [{binVersion: configObj.serverSourceVersion}],
+            config: [{binVersion: configObj.serverSourceVersion}]
+        };
         var shardingTest = new ShardingTest(shardingTestConfig);
         var serverSource = shardingTest.s;
-    }
-    else {
-        var serverSource = MongoRunner.runMongod({ binVersion : configObj.serverSourceVersion,
-                                                   setParameter : "textSearchEnabled=true",
-                                                   dbpath : configObj.testDbpath });
+    } else {
+        var serverSource = MongoRunner.runMongod(
+            {binVersion: configObj.serverSourceVersion, dbpath: configObj.testDbpath});
     }
     var sourceDB = serverSource.getDB(testBaseName);
 
     // Create generators to create collections with our seed data
     // Testing with both a capped collection and a normal collection
-    var cappedCollGen = new CollectionDataGenerator({ "capped" : true });
-    var collGen = new CollectionDataGenerator({ "capped" : false });
+    var cappedCollGen = new CollectionDataGenerator({"capped": true});
+    var collGen = new CollectionDataGenerator({"capped": false});
 
     // Create collections using the different generators
     var sourceCollCapped = createCollectionWithData(sourceDB, "cappedColl", cappedCollGen);
@@ -85,72 +79,54 @@ function multiVersionDumpRestoreTest(configObj) {
     var collValid = new CollectionDataValidator();
     collValid.recordCollectionData(sourceColl);
 
-    // Dump using the specified version of mongodump, either using the data files directly or from
-    // the running mongod instance
-    if (configObj.dumpType === "direct") {
+    // Dump using the specified version of mongodump from the running mongod or mongos instance.
+    if (configObj.dumpType === "mongod") {
+        MongoRunner.runMongoTool("mongodump",
+                                 {
+                                   out: configObj.dumpDir,
+                                   binVersion: configObj.mongoDumpVersion,
+                                   host: serverSource.host,
+                                   db: testBaseName
+                                 });
         MongoRunner.stopMongod(serverSource.port);
-        MongoRunner.runMongoTool("mongodump", { out : configObj.dumpDir,
-                                                binVersion : configObj.mongoDumpVersion,
-                                                dbpath : configObj.testDbpath,
-                                                db : testBaseName });
-    }
-    else if (configObj.dumpType === "mongod") {
-        MongoRunner.runMongoTool("mongodump", { out : configObj.dumpDir,
-                                                binVersion : configObj.mongoDumpVersion,
-                                                host : serverSource.host,
-                                                db : testBaseName });
-        MongoRunner.stopMongod(serverSource.port);
-    }
-    else { /* "mongos" */
-        MongoRunner.runMongoTool("mongodump", { out : configObj.dumpDir,
-                                                binVersion : configObj.mongoDumpVersion,
-                                                host : serverSource.host,
-                                                db : testBaseName });
+    } else { /* "mongos" */
+        MongoRunner.runMongoTool("mongodump",
+                                 {
+                                   out: configObj.dumpDir,
+                                   binVersion: configObj.mongoDumpVersion,
+                                   host: serverSource.host,
+                                   db: testBaseName
+                                 });
         shardingTest.stop();
     }
 
     // Restore using the specified version of mongorestore
-    if (configObj.restoreType === "direct") {
+    if (configObj.restoreType === "mongod") {
+        var serverDest = MongoRunner.runMongod({binVersion: configObj.serverDestVersion});
 
-        // Clear out the dbpath we are restoring to
-        resetDbpath(configObj.testDbpath);
-
-        // Restore directly to the destination dbpath
-        MongoRunner.runMongoTool("mongorestore", { dir : configObj.dumpDir + "/" + testBaseName,
-                                                   binVersion : configObj.mongoRestoreVersion,
-                                                   dbpath : configObj.testDbpath,
-                                                   db : testBaseName });
-
-        // Start a mongod on the dbpath we just restored to
-        // Need to pass the "restart" option otherwise the data files get cleared automatically
-        serverDest = MongoRunner.runMongod({ binVersion : configObj.serverDestVersion,
-                                             setParameter : "textSearchEnabled=true",
-                                             dbpath : configObj.testDbpath,
-                                             restart : true });
-    }
-    else if (configObj.restoreType === "mongod") {
-        var serverDest = MongoRunner.runMongod({ binVersion : configObj.serverDestVersion,
-                                                 setParameter : "textSearchEnabled=true" });
-
-        MongoRunner.runMongoTool("mongorestore", { dir : configObj.dumpDir + "/" + testBaseName,
-                                                   binVersion : configObj.mongoRestoreVersion,
-                                                   host : serverDest.host,
-                                                   db : testBaseName });
-    }
-    else { /* "mongos" */
+        MongoRunner.runMongoTool("mongorestore",
+                                 {
+                                   dir: configObj.dumpDir + "/" + testBaseName,
+                                   binVersion: configObj.mongoRestoreVersion,
+                                   host: serverDest.host,
+                                   db: testBaseName
+                                 });
+    } else { /* "mongos" */
         var shardingTestConfig = {
-            name : testBaseName + "_sharded_dest",
-            mongos : [{ binVersion : configObj.serverDestVersion }],
-            shards : [{ binVersion : configObj.serverDestVersion,
-                        setParameter : "textSearchEnabled=true" }],
-            config : [{ binVersion : configObj.serverDestVersion }]
-        }
+            name: testBaseName + "_sharded_dest",
+            mongos: [{binVersion: configObj.serverDestVersion}],
+            shards: [{binVersion: configObj.serverDestVersion}],
+            config: [{binVersion: configObj.serverDestVersion}]
+        };
         var shardingTest = new ShardingTest(shardingTestConfig);
         serverDest = shardingTest.s;
-        MongoRunner.runMongoTool("mongorestore", { dir : configObj.dumpDir + "/" + testBaseName,
-                                                   binVersion : configObj.mongoRestoreVersion,
-                                                   host : serverDest.host,
-                                                   db : testBaseName });
+        MongoRunner.runMongoTool("mongorestore",
+                                 {
+                                   dir: configObj.dumpDir + "/" + testBaseName,
+                                   binVersion: configObj.mongoRestoreVersion,
+                                   host: serverDest.host,
+                                   db: testBaseName
+                                 });
     }
 
     var destDB = serverDest.getDB(testBaseName);
@@ -171,8 +147,7 @@ function multiVersionDumpRestoreTest(configObj) {
 
     if (configObj.restoreType === "mongos") {
         shardingTest.stop();
-    }
-    else {
+    } else {
         MongoRunner.stopMongod(serverDest.port);
     }
 }
@@ -194,9 +169,7 @@ function multiVersionDumpRestoreTest(configObj) {
 // { "a" : 0, "b" : 3 }
 // { "a" : 1, "b" : 3 }
 function getPermutationIterator(permsObj) {
-
     function getAllPermutations(permsObj) {
-
         // Split our permutations object into "first" and "rest"
         var gotFirst = false;
         var firstKey;
@@ -206,8 +179,7 @@ function getPermutationIterator(permsObj) {
             if (permsObj.hasOwnProperty(key)) {
                 if (gotFirst) {
                     restObj[key] = permsObj[key];
-                }
-                else {
+                } else {
                     firstKey = key;
                     firstValues = permsObj[key];
                     gotFirst = true;
@@ -239,13 +211,13 @@ function getPermutationIterator(permsObj) {
     var currentPermutation = 0;
 
     return {
-        "next" : function () {
+        "next": function() {
             return allPermutations[currentPermutation++];
         },
-        "hasNext" : function () {
+        "hasNext": function() {
             return currentPermutation < allPermutations.length;
         }
-    }
+    };
 }
 
 // Given a "test spec" object, runs all test combinations.
@@ -259,8 +231,8 @@ function getPermutationIterator(permsObj) {
 //     'mongoRestoreVersion' :[ "latest", "2.4" ],
 //     'dumpDir' : [ dumpDir ],
 //     'testDbpath' : [ testDbpath ],
-//     'dumpType' : [ "direct", "mongod", "mongos" ],
-//     'restoreType' : [ "direct", "mongod", "mongos" ]
+//     'dumpType' : [ "mongod", "mongos" ],
+//     'restoreType' : [ "mongod", "mongos" ]
 // }
 //
 // This function will run a test for each possible combination of the parameters.  See comments on

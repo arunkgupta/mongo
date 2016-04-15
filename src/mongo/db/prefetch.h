@@ -27,18 +27,13 @@
 */
 #pragma once
 
-#include "mongo/db/jsobj.h"
-#include "mongo/db/diskloc.h"
-#include "mongo/db/repl/repl_set_impl.h"
-
 namespace mongo {
-    class Collection;
-    class Database;
-    class OperationContext;
+class BSONObj;
+class Database;
+class OperationContext;
+namespace repl {
 
-    // page in both index and data pages for an op from the oplog
-    void prefetchPagesForReplicatedOp(OperationContext* txn,
-                                      Database* db,
-                                      const repl::ReplSetImpl::IndexPrefetchConfig& prefetchConfig,
-                                      const BSONObj& op);
-}
+// page in possible index and/or data pages for an op from the oplog
+void prefetchPagesForReplicatedOp(OperationContext* txn, Database* db, const BSONObj& op);
+}  // namespace repl
+}  // namespace mongo

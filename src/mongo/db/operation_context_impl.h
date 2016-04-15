@@ -27,46 +27,44 @@
  */
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
 #include <string>
 
 #include "mongo/db/operation_context.h"
 
-
 namespace mongo {
 
-    class OperationContextImpl : public OperationContext  {
-    public:
-        OperationContextImpl();
+class OperationContextImpl : public OperationContext {
+public:
+    OperationContextImpl();
 
-        virtual ~OperationContextImpl();
+    virtual ~OperationContextImpl();
 
-        virtual RecoveryUnit* recoveryUnit() const;
+    virtual RecoveryUnit* recoveryUnit() const override;
 
-        virtual LockState* lockState() const;
+    virtual RecoveryUnit* releaseRecoveryUnit() override;
 
-        virtual ProgressMeter* setMessage(const char* msg,
-                                          const std::string& name,
-                                          unsigned long long progressMeterTotal,
-                                          int secondsBetween);
+    virtual RecoveryUnitState setRecoveryUnit(RecoveryUnit* unit, RecoveryUnitState state) override;
 
-        virtual const char * getNS() const;
+    virtual ProgressMeter* setMessage_inlock(const char* msg,
+                                             const std::string& name,
+                                             unsigned long long progressMeterTotal,
+                                             int secondsBetween) override;
 
-        virtual Client* getClient() const;
+    virtual std::string getNS() const override;
 
-        virtual CurOp* getCurOp() const;
+    virtual uint64_t getRemainingMaxTimeMicros() const override;
 
-        virtual void checkForInterrupt(bool heedMutex = true) const;
+    virtual void checkForInterrupt() override;
+    virtual Status checkForInterruptNoAssert() override;
 
-        virtual Status checkForInterruptNoAssert() const;
+    virtual bool isPrimaryFor(StringData ns) override;
 
-        virtual bool isPrimaryFor( const StringData& ns );
+    virtual void setReplicatedWrites(bool writesAreReplicated = true) override;
+    virtual bool writesAreReplicated() const override;
 
-        virtual Transaction* getTransaction();
-
-    private:
-        boost::scoped_ptr<RecoveryUnit> _recovery;
-        Transaction _tx;
-    };
+private:
+    std::unique_ptr<RecoveryUnit> _recovery;
+    bool _writesAreReplicated;
+};
 
 }  // namespace mongo

@@ -30,93 +30,88 @@
 
 #pragma once
 
+#include "mongo/base/disallow_copying.h"
 #include "mongo/client/dbclientinterface.h"
-#include "mongo/db/client.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/s/catalog/catalog_manager.h"
 
 namespace mongo {
 
-    struct CloneOptions;
-    class DBClientBase;
-    class DBClientCursor;
-    class OperationContext;
-    class Query;
+struct CloneOptions;
+class DBClientBase;
+class NamespaceString;
+class OperationContext;
 
-    class Cloner: boost::noncopyable {
-    public:
-        Cloner();
 
-        void setConnection(DBClientBase* c) {
-            _conn.reset(c);
-        }
+class Cloner {
+    MONGO_DISALLOW_COPYING(Cloner);
 
-        /** copy the entire database */
-        bool go(OperationContext* txn,
-                const std::string& toDBName,
-                const std::string& masterHost,
-                const CloneOptions& opts,
-                std::set<std::string>* clonedColls,
-                std::string& errmsg,
-                int *errCode = 0);
+public:
+    Cloner();
 
-        bool copyCollection(OperationContext* txn,
-                            const std::string& ns,
-                            const BSONObj& query,
-                            std::string& errmsg,
-                            bool mayYield,
-                            bool mayBeInterrupted,
-                            bool copyIndexes = true,
-                            bool logForRepl = true );
-
-    private:
-        void copy(OperationContext* txn,
-                  const std::string& toDBName,
-                  const char *from_ns,
-                  const char *to_ns,
-                  bool isindex,
-                  bool logForRepl,
-                  bool masterSameProcess,
-                  bool slaveOk,
-                  bool mayYield,
-                  bool mayBeInterrupted,
-                  Query q);
-
-        struct Fun;
-        std::auto_ptr<DBClientBase> _conn;
-    };
+    void setConnection(DBClientBase* c) {
+        _conn.reset(c);
+    }
 
     /**
-     *  slaveOk     - if true it is ok if the source of the data is !ismaster.
-     *  useReplAuth - use the credentials we normally use as a replication slave for the cloning
-     *  snapshot    - use $snapshot mode for copying collections.  note this should not be used
-     *                when it isn't required, as it will be slower.  for example,
-     *                repairDatabase need not use it.
+     * Copies an entire database from the specified host.
      */
-    struct CloneOptions {
-        CloneOptions() {
-            logForRepl = true;
-            slaveOk = false;
-            useReplAuth = false;
-            snapshot = true;
-            mayYield = true;
-            mayBeInterrupted = false;
+    Status copyDb(OperationContext* txn,
+                  const std::string& toDBName,
+                  const std::string& masterHost,
+                  const CloneOptions& opts,
+                  std::set<std::string>* clonedColls);
 
-            syncData = true;
-            syncIndexes = true;
-        }
+    bool copyCollection(OperationContext* txn,
+                        const std::string& ns,
+                        const BSONObj& query,
+                        std::string& errmsg,
+                        bool copyIndexes);
 
-        std::string fromDB;
-        std::set<std::string> collsToIgnore;
+private:
+    void copy(OperationContext* txn,
+              const std::string& toDBName,
+              const NamespaceString& from_ns,
+              const BSONObj& from_opts,
+              const NamespaceString& to_ns,
+              bool masterSameProcess,
+              const CloneOptions& opts,
+              Query q);
 
-        bool logForRepl;
-        bool slaveOk;
-        bool useReplAuth;
-        bool snapshot;
-        bool mayYield;
-        bool mayBeInterrupted;
+    void copyIndexes(OperationContext* txn,
+                     const std::string& toDBName,
+                     const NamespaceString& from_ns,
+                     const BSONObj& from_opts,
+                     const NamespaceString& to_ns,
+                     bool masterSameProcess,
+                     bool slaveOk);
 
-        bool syncData;
-        bool syncIndexes;
-    };
+    struct Fun;
+    std::unique_ptr<DBClientBase> _conn;
+};
 
-} // namespace mongo
+/**
+ *  slaveOk     - if true it is ok if the source of the data is !ismaster.
+ *  useReplAuth - use the credentials we normally use as a replication slave for the cloning
+ *  snapshot    - use snapshot mode for copying collections.  note this should not be used
+ *                when it isn't required, as it will be slower.  for example,
+ *                repairDatabase need not use it.
+ *  checkForCatalogChange - Internal option set for clone commands initiated by a mongos that are
+ *                holding a distributed lock (such as movePrimary).  Indicates that we need to
+ *                be periodically checking to see if the catalog manager has swapped and fail
+ *                if it has so that we don't block the mongos that initiated the command.
+ */
+struct CloneOptions {
+    std::string fromDB;
+    std::set<std::string> collsToIgnore;
+
+    bool slaveOk = false;
+    bool useReplAuth = false;
+    bool snapshot = true;
+
+    bool syncData = true;
+    bool syncIndexes = true;
+    bool checkForCatalogChange = false;
+    CatalogManager::ConfigServerMode initialCatalogMode = CatalogManager::ConfigServerMode::NONE;
+};
+
+}  // namespace mongo

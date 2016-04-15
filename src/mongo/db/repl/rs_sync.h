@@ -35,16 +35,13 @@
 #include "mongo/db/storage/mmap_v1/dur.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/initial_sync.h"
-#include "mongo/db/repl/sync.h"
 #include "mongo/db/repl/sync_tail.h"
-#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/concurrency/old_thread_pool.h"
 
 namespace mongo {
 namespace repl {
-    // TODO: move hbmsg into an error-keeping class (SERVER-4444)
-    void sethbmsg(const std::string& s, const int logLevel=0);
+// Body of the thread that will do the background sync.
+void runSyncThread();
 
-    extern int maxSyncSourceLagSecs;
-
-} // namespace repl
-} // namespace mongo
+}  // namespace repl
+}  // namespace mongo

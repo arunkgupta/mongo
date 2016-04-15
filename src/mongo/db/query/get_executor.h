@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2013-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -31,97 +31,154 @@
 #include "mongo/db/query/query_planner_params.h"
 #include "mongo/db/query/query_settings.h"
 #include "mongo/db/query/query_solution.h"
+#include "mongo/db/ops/delete_request.h"
+#include "mongo/db/ops/parsed_delete.h"
+#include "mongo/db/ops/parsed_update.h"
+#include "mongo/db/ops/update_driver.h"
+#include "mongo/db/ops/update_request.h"
 
 namespace mongo {
 
-    class Collection;
+class Collection;
+class CountRequest;
 
-    /**
-     * Filter indexes retrieved from index catalog by
-     * allowed indices in query settings.
-     * Used by getRunner().
-     * This function is public to facilitate testing.
-     */
-    void filterAllowedIndexEntries(const AllowedIndices& allowedIndices,
-                                   std::vector<IndexEntry>* indexEntries);
+struct GroupRequest;
 
-    /**
-     * Fill out the provided 'plannerParams' for the 'canonicalQuery' operating on the collection
-     * 'collection'.  Exposed for testing.
-     */
-    void fillOutPlannerParams(Collection* collection,
-                              CanonicalQuery* canonicalQuery,
-                              QueryPlannerParams* plannerParams);
+/**
+ * Filter indexes retrieved from index catalog by
+ * allowed indices in query settings.
+ * Used by getExecutor().
+ * This function is public to facilitate testing.
+ */
+void filterAllowedIndexEntries(const AllowedIndices& allowedIndices,
+                               std::vector<IndexEntry>* indexEntries);
 
-    /**
-     * Get a plan executor for a query. Does not take ownership of canonicalQuery.
-     *
-     * If the query is valid and an executor could be created, returns Status::OK()
-     * and populates *out with the PlanExecutor.
-     *
-     * If the query cannot be executed, returns a Status indicating why.  Deletes
-     * rawCanonicalQuery.
-     */
-    Status getExecutor(Collection* collection,
-                       CanonicalQuery* canonicalQuery,
-                       PlanExecutor** out,
-                       size_t plannerOptions = 0);
+/**
+ * Fill out the provided 'plannerParams' for the 'canonicalQuery' operating on the collection
+ * 'collection'.  Exposed for testing.
+ */
+void fillOutPlannerParams(OperationContext* txn,
+                          Collection* collection,
+                          CanonicalQuery* canonicalQuery,
+                          QueryPlannerParams* plannerParams);
 
-    /**
-     * Get a plan executor for a simple id query. The executor will wrap an execution
-     * tree whose root stage is the idhack stage.
-     *
-     * Does not take ownership of 'query'.
-     */
-    Status getExecutorIDHack(Collection* collection,
-                             CanonicalQuery* query,
-                             const QueryPlannerParams& plannerParams,
-                             PlanExecutor** out);
+/**
+ * Get a plan executor for a query.
+ *
+ * If the query is valid and an executor could be created, returns a StatusWith with the
+ * PlanExecutor.
+ *
+ * If the query cannot be executed, returns a Status indicating why.
+ */
+StatusWith<std::unique_ptr<PlanExecutor>> getExecutor(
+    OperationContext* txn,
+    Collection* collection,
+    std::unique_ptr<CanonicalQuery> canonicalQuery,
+    PlanExecutor::YieldPolicy yieldPolicy,
+    size_t plannerOptions = 0);
 
-    /**
-     * If possible, turn the provided QuerySolution into a QuerySolution that uses a DistinctNode
-     * to provide results for the distinct command.
-     *
-     * If the provided solution could be mutated successfully, returns true, otherwise returns
-     * false.
-     */
-    bool turnIxscanIntoDistinctIxscan(QuerySolution* soln, const string& field);
+/**
+ * Get a plan executor for a .find() operation.
+ *
+ * If the query is valid and an executor could be created, returns a StatusWith with the
+ * PlanExecutor.
+ *
+ * If the query cannot be executed, returns a Status indicating why.
+ */
+StatusWith<std::unique_ptr<PlanExecutor>> getExecutorFind(
+    OperationContext* txn,
+    Collection* collection,
+    const NamespaceString& nss,
+    std::unique_ptr<CanonicalQuery> canonicalQuery,
+    PlanExecutor::YieldPolicy yieldPolicy);
 
-    /*
-     * Get an executor for a query executing as part of a distinct command.
-     *
-     * Distinct is unique in that it doesn't care about getting all the results; it just wants all
-     * possible values of a certain field.  As such, we can skip lots of data in certain cases (see
-     * body of method for detail).
-     */
-    Status getExecutorDistinct(Collection* collection,
-                               const BSONObj& query,
-                               const std::string& field,
-                               PlanExecutor** out);
+/**
+ * If possible, turn the provided QuerySolution into a QuerySolution that uses a DistinctNode
+ * to provide results for the distinct command.
+ *
+ * If the provided solution could be mutated successfully, returns true, otherwise returns
+ * false.
+ */
+bool turnIxscanIntoDistinctIxscan(QuerySolution* soln, const std::string& field);
 
-    /*
-     * Get a PlanExecutor for a query executing as part of a count command.
-     *
-     * Count doesn't care about actually examining its results; it just wants to walk through them.
-     * As such, with certain covered queries, we can skip the overhead of fetching etc. when
-     * executing a count.
-     */
-    Status getExecutorCount(Collection* collection,
-                            const BSONObj& query,
-                            const BSONObj& hintObj,
-                            PlanExecutor** execOut);
+/*
+ * Get an executor for a query executing as part of a distinct command.
+ *
+ * Distinct is unique in that it doesn't care about getting all the results; it just wants all
+ * possible values of a certain field.  As such, we can skip lots of data in certain cases (see
+ * body of method for detail).
+ */
+StatusWith<std::unique_ptr<PlanExecutor>> getExecutorDistinct(
+    OperationContext* txn,
+    Collection* collection,
+    const std::string& ns,
+    const BSONObj& query,
+    const std::string& field,
+    bool isExplain,
+    PlanExecutor::YieldPolicy yieldPolicy);
 
-    /**
-     * Get a plan executor for a query. Ignores the cache and always plans the full query.
-     *
-     * Does not take ownership of its arguments.
-     *
-     * Returns the resulting executor through 'execOut'. The caller must delete 'execOut',
-     * if an OK status is returned.
-     */
-    Status getExecutorAlwaysPlan(Collection* collection,
-                                 CanonicalQuery* canonicalQuery,
-                                 const QueryPlannerParams& plannerParams,
-                                 PlanExecutor** execOut);
+/*
+ * Get a PlanExecutor for a query executing as part of a count command.
+ *
+ * Count doesn't care about actually examining its results; it just wants to walk through them.
+ * As such, with certain covered queries, we can skip the overhead of fetching etc. when
+ * executing a count.
+ */
+StatusWith<std::unique_ptr<PlanExecutor>> getExecutorCount(OperationContext* txn,
+                                                           Collection* collection,
+                                                           const CountRequest& request,
+                                                           bool explain,
+                                                           PlanExecutor::YieldPolicy yieldPolicy);
+
+/**
+ * Get a PlanExecutor for a delete operation. 'parsedDelete' describes the query predicate
+ * and delete flags like 'isMulti'. The caller must hold the appropriate MODE_X or MODE_IX
+ * locks, and must not release these locks until after the returned PlanExecutor is deleted.
+ *
+ * The returned PlanExecutor will yield if and only if parsedDelete->canYield().
+ *
+ * Does not take ownership of its arguments.
+ *
+ * If the query is valid and an executor could be created, returns a StatusWith with the
+ * PlanExecutor.
+ *
+ * If the query cannot be executed, returns a Status indicating why.
+ */
+StatusWith<std::unique_ptr<PlanExecutor>> getExecutorDelete(OperationContext* txn,
+                                                            Collection* collection,
+                                                            ParsedDelete* parsedDelete);
+
+/**
+ * Get a PlanExecutor for an update operation. 'parsedUpdate' describes the query predicate
+ * and update modifiers. The caller must hold the appropriate MODE_X or MODE_IX locks prior
+ * to calling this function, and must not release these locks until after the returned
+ * PlanExecutor is deleted.
+ *
+ * The returned PlanExecutor will yield if and only if parsedUpdate->canYield().
+ *
+ * Does not take ownership of its arguments.
+ *
+ * If the query is valid and an executor could be created, returns a StatusWith with the
+ * PlanExecutor.
+ *
+ * If the query cannot be executed, returns a Status indicating why.
+ */
+StatusWith<std::unique_ptr<PlanExecutor>> getExecutorUpdate(OperationContext* txn,
+                                                            Collection* collection,
+                                                            ParsedUpdate* parsedUpdate,
+                                                            OpDebug* opDebug);
+
+/**
+ * Get a PlanExecutor for a group operation.
+ *
+ * If the query is valid and an executor could be created, returns a StatusWith with the
+ * PlanExecutor.
+ *
+ * If an executor could not be created, returns a Status indicating why.
+ */
+StatusWith<std::unique_ptr<PlanExecutor>> getExecutorGroup(OperationContext* txn,
+                                                           Collection* collection,
+                                                           const GroupRequest& request,
+                                                           PlanExecutor::YieldPolicy yieldPolicy);
 
 }  // namespace mongo

@@ -10,9 +10,11 @@ env.Library(
         'path_support.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/bson',
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/bson/mutable/mutable_bson',
         '$BUILD_DIR/mongo/db/common',
-        '$BUILD_DIR/mongo/foundation',
+        '$BUILD_DIR/mongo/util/foundation',
+        '$BUILD_DIR/mongo/db/matcher/expressions',
     ],
 )
 
@@ -32,7 +34,7 @@ env.CppUnitTest(
         'log_builder_test.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/mutable_bson_test_utils',
+        '$BUILD_DIR/mongo/bson/mutable/mutable_bson_test_utils',
         'update_common',
     ],
 )
@@ -43,7 +45,8 @@ env.CppUnitTest(
         'path_support_test.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/mutable_bson_test_utils',
+        '$BUILD_DIR/mongo/bson/mutable/mutable_bson_test_utils',
+        '$BUILD_DIR/mongo/db/matcher/expressions',
         'update_common',
     ],
 )
@@ -66,8 +69,9 @@ env.Library(
         'modifier_unset.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/expressions',
-        '$BUILD_DIR/mongo/global_optime',
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/matcher/expressions',
+        '$BUILD_DIR/mongo/db/global_timestamp',
         'update_common',
     ],
 )
@@ -76,7 +80,7 @@ env.CppUnitTest(
     target='modifier_add_to_set_test',
     source='modifier_add_to_set_test.cpp',
     LIBDEPS=[
-        '$BUILD_DIR/mongo/mutable_bson_test_utils',
+        '$BUILD_DIR/mongo/bson/mutable/mutable_bson_test_utils',
         'update',
     ],
 )
@@ -85,7 +89,7 @@ env.CppUnitTest(
     target='modifier_bit_test',
     source='modifier_bit_test.cpp',
     LIBDEPS=[
-        '$BUILD_DIR/mongo/mutable_bson_test_utils',
+        '$BUILD_DIR/mongo/bson/mutable/mutable_bson_test_utils',
         'update',
     ],
 )
@@ -94,7 +98,7 @@ env.CppUnitTest(
     target='modifier_compare_test',
     source='modifier_compare_test.cpp',
     LIBDEPS=[
-        '$BUILD_DIR/mongo/mutable_bson_test_utils',
+        '$BUILD_DIR/mongo/bson/mutable/mutable_bson_test_utils',
         'update',
     ],
 )
@@ -103,7 +107,7 @@ env.CppUnitTest(
     target='modifier_current_date_test',
     source='modifier_current_date_test.cpp',
     LIBDEPS=[
-        '$BUILD_DIR/mongo/mutable_bson_test_utils',
+        '$BUILD_DIR/mongo/bson/mutable/mutable_bson_test_utils',
         'update',
     ],
 )
@@ -112,7 +116,7 @@ env.CppUnitTest(
     target='modifier_inc_test',
     source='modifier_inc_test.cpp',
     LIBDEPS=[
-        '$BUILD_DIR/mongo/mutable_bson_test_utils',
+        '$BUILD_DIR/mongo/bson/mutable/mutable_bson_test_utils',
         'update',
     ],
 )
@@ -121,7 +125,7 @@ env.CppUnitTest(
     target='modifier_object_replace_test',
     source='modifier_object_replace_test.cpp',
     LIBDEPS=[
-        '$BUILD_DIR/mongo/mutable_bson_test_utils',
+        '$BUILD_DIR/mongo/bson/mutable/mutable_bson_test_utils',
         'update',
     ],
 )
@@ -130,7 +134,7 @@ env.CppUnitTest(
     target='modifier_pop_test',
     source='modifier_pop_test.cpp',
     LIBDEPS=[
-        '$BUILD_DIR/mongo/mutable_bson_test_utils',
+        '$BUILD_DIR/mongo/bson/mutable/mutable_bson_test_utils',
         'update',
     ],
 )
@@ -147,7 +151,7 @@ env.CppUnitTest(
     target='modifier_pull_all_test',
     source='modifier_pull_all_test.cpp',
     LIBDEPS=[
-        '$BUILD_DIR/mongo/mutable_bson_test_utils',
+        '$BUILD_DIR/mongo/bson/mutable/mutable_bson_test_utils',
         'update',
     ],
 )
@@ -156,7 +160,7 @@ env.CppUnitTest(
     target='modifier_pull_test',
     source='modifier_pull_test.cpp',
     LIBDEPS=[
-        '$BUILD_DIR/mongo/mutable_bson_test_utils',
+        '$BUILD_DIR/mongo/bson/mutable/mutable_bson_test_utils',
         'update',
     ],
 )
@@ -165,7 +169,7 @@ env.CppUnitTest(
     target='modifier_push_test',
     source='modifier_push_test.cpp',
     LIBDEPS=[
-        '$BUILD_DIR/mongo/mutable_bson_test_utils',
+        '$BUILD_DIR/mongo/bson/mutable/mutable_bson_test_utils',
         'update',
     ],
 )
@@ -174,7 +178,7 @@ env.CppUnitTest(
     target='modifier_rename_test',
     source='modifier_rename_test.cpp',
     LIBDEPS=[
-        '$BUILD_DIR/mongo/mutable_bson_test_utils',
+        '$BUILD_DIR/mongo/bson/mutable/mutable_bson_test_utils',
         'update',
     ],
 )
@@ -183,7 +187,7 @@ env.CppUnitTest(
     target='modifier_set_test',
     source='modifier_set_test.cpp',
     LIBDEPS=[
-        '$BUILD_DIR/mongo/mutable_bson_test_utils',
+        '$BUILD_DIR/mongo/bson/mutable/mutable_bson_test_utils',
         'update',
     ],
 )
@@ -192,7 +196,7 @@ env.CppUnitTest(
     target='modifier_unset_test',
     source='modifier_unset_test.cpp',
     LIBDEPS=[
-        '$BUILD_DIR/mongo/mutable_bson_test_utils',
+        '$BUILD_DIR/mongo/bson/mutable/mutable_bson_test_utils',
         'update',
     ],
 )
@@ -204,10 +208,10 @@ env.Library(
         'update_driver.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/bson',
+        '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/common',
         '$BUILD_DIR/mongo/db/query/query_planner',
-        '$BUILD_DIR/mongo/index_set',
+        '$BUILD_DIR/mongo/db/update_index_data',
         'update',
     ],
 )
@@ -224,7 +228,7 @@ env.CppUnitTest(
     target='update_driver_test',
     source='update_driver_test.cpp',
     LIBDEPS=[
-        '$BUILD_DIR/mongo/mutable_bson_test_utils',
+        '$BUILD_DIR/mongo/bson/mutable/mutable_bson_test_utils',
         '$BUILD_DIR/mongo/db/query/query_planner',
         'update_driver',
     ],

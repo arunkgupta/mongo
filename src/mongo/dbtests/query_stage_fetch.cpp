@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2013-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -30,188 +30,202 @@
  * This file tests db/exec/fetch.cpp.  Fetch goes to disk so we cannot test outside of a dbtest.
  */
 
-#include <boost/shared_ptr.hpp>
 
 #include "mongo/client/dbclientcursor.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/exec/mock_stage.h"
-#include "mongo/db/instance.h"
+#include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/operation_context_impl.h"
-#include "mongo/db/catalog/collection.h"
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/stdx/memory.h"
 
 namespace QueryStageFetch {
 
-    class QueryStageFetchBase {
-    public:
-        QueryStageFetchBase() : _client(&_txn) {
-        
+using std::set;
+using std::shared_ptr;
+using std::unique_ptr;
+using stdx::make_unique;
+
+class QueryStageFetchBase {
+public:
+    QueryStageFetchBase() : _client(&_txn) {}
+
+    virtual ~QueryStageFetchBase() {
+        _client.dropCollection(ns());
+    }
+
+    void getRecordIds(set<RecordId>* out, Collection* coll) {
+        auto cursor = coll->getCursor(&_txn);
+        while (auto record = cursor->next()) {
+            out->insert(record->id);
+        }
+    }
+
+    void insert(const BSONObj& obj) {
+        _client.insert(ns(), obj);
+    }
+
+    void remove(const BSONObj& obj) {
+        _client.remove(ns(), obj);
+    }
+
+    static const char* ns() {
+        return "unittests.QueryStageFetch";
+    }
+
+protected:
+    OperationContextImpl _txn;
+    DBDirectClient _client;
+};
+
+
+//
+// Test that a WSM with an obj is passed through verbatim.
+//
+class FetchStageAlreadyFetched : public QueryStageFetchBase {
+public:
+    void run() {
+        OldClientWriteContext ctx(&_txn, ns());
+        Database* db = ctx.db();
+        Collection* coll = db->getCollection(ns());
+        if (!coll) {
+            WriteUnitOfWork wuow(&_txn);
+            coll = db->createCollection(&_txn, ns());
+            wuow.commit();
         }
 
-        virtual ~QueryStageFetchBase() {
-            _client.dropCollection(ns());
+        WorkingSet ws;
+
+        // Add an object to the DB.
+        insert(BSON("foo" << 5));
+        set<RecordId> recordIds;
+        getRecordIds(&recordIds, coll);
+        ASSERT_EQUALS(size_t(1), recordIds.size());
+
+        // Create a mock stage that returns the WSM.
+        auto mockStage = make_unique<QueuedDataStage>(&_txn, &ws);
+
+        // Mock data.
+        {
+            WorkingSetID id = ws.allocate();
+            WorkingSetMember* mockMember = ws.get(id);
+            mockMember->recordId = *recordIds.begin();
+            mockMember->obj = coll->docFor(&_txn, mockMember->recordId);
+            ws.transitionToRecordIdAndObj(id);
+            // Points into our DB.
+            mockStage->pushBack(id);
+        }
+        {
+            WorkingSetID id = ws.allocate();
+            WorkingSetMember* mockMember = ws.get(id);
+            mockMember->recordId = RecordId();
+            mockMember->obj = Snapshotted<BSONObj>(SnapshotId(), BSON("foo" << 6));
+            mockMember->transitionToOwnedObj();
+            ASSERT_TRUE(mockMember->obj.value().isOwned());
+            mockStage->pushBack(id);
         }
 
-        void getLocs(set<DiskLoc>* out, Collection* coll) {
-            RecordIterator* it = coll->getIterator(DiskLoc(), false,
-                                                       CollectionScanParams::FORWARD);
-            while (!it->isEOF()) {
-                DiskLoc nextLoc = it->getNext();
-                out->insert(nextLoc);
-            }
-            delete it;
+        unique_ptr<FetchStage> fetchStage(
+            new FetchStage(&_txn, &ws, mockStage.release(), NULL, coll));
+
+        WorkingSetID id = WorkingSet::INVALID_ID;
+        PlanStage::StageState state;
+
+        // Don't bother doing any fetching if an obj exists already.
+        state = fetchStage->work(&id);
+        ASSERT_EQUALS(PlanStage::ADVANCED, state);
+        state = fetchStage->work(&id);
+        ASSERT_EQUALS(PlanStage::ADVANCED, state);
+
+        // No more data to fetch, so, EOF.
+        state = fetchStage->work(&id);
+        ASSERT_EQUALS(PlanStage::IS_EOF, state);
+    }
+};
+
+//
+// Test matching with fetch.
+//
+class FetchStageFilter : public QueryStageFetchBase {
+public:
+    void run() {
+        ScopedTransaction transaction(&_txn, MODE_IX);
+        Lock::DBLock lk(_txn.lockState(), nsToDatabaseSubstring(ns()), MODE_X);
+        OldClientContext ctx(&_txn, ns());
+        Database* db = ctx.db();
+        Collection* coll = db->getCollection(ns());
+        if (!coll) {
+            WriteUnitOfWork wuow(&_txn);
+            coll = db->createCollection(&_txn, ns());
+            wuow.commit();
         }
 
-        void insert(const BSONObj& obj) {
-            _client.insert(ns(), obj);
+        WorkingSet ws;
+
+        // Add an object to the DB.
+        insert(BSON("foo" << 5));
+        set<RecordId> recordIds;
+        getRecordIds(&recordIds, coll);
+        ASSERT_EQUALS(size_t(1), recordIds.size());
+
+        // Create a mock stage that returns the WSM.
+        auto mockStage = make_unique<QueuedDataStage>(&_txn, &ws);
+
+        // Mock data.
+        {
+            WorkingSetID id = ws.allocate();
+            WorkingSetMember* mockMember = ws.get(id);
+            mockMember->recordId = *recordIds.begin();
+            ws.transitionToRecordIdAndIdx(id);
+
+            // State is RecordId and index, shouldn't be able to get the foo data inside.
+            BSONElement elt;
+            ASSERT_FALSE(mockMember->getFieldDotted("foo", &elt));
+            mockStage->pushBack(id);
         }
 
-        void remove(const BSONObj& obj) {
-            _client.remove(ns(), obj);
-        }
+        // Make the filter.
+        BSONObj filterObj = BSON("foo" << 6);
+        StatusWithMatchExpression statusWithMatcher =
+            MatchExpressionParser::parse(filterObj, ExtensionsCallbackDisallowExtensions());
+        verify(statusWithMatcher.isOK());
+        unique_ptr<MatchExpression> filterExpr = std::move(statusWithMatcher.getValue());
 
-        static const char* ns() { return "unittests.QueryStageFetch"; }
+        // Matcher requires that foo==6 but we only have data with foo==5.
+        unique_ptr<FetchStage> fetchStage(
+            new FetchStage(&_txn, &ws, mockStage.release(), filterExpr.get(), coll));
 
-    private:
-        OperationContextImpl _txn;
-        DBDirectClient _client;
-    };
+        // First call should return a fetch request as it's not in memory.
+        WorkingSetID id = WorkingSet::INVALID_ID;
+        PlanStage::StageState state;
 
+        // Normally we'd return the object but we have a filter that prevents it.
+        state = fetchStage->work(&id);
+        ASSERT_EQUALS(PlanStage::NEED_TIME, state);
 
-    //
-    // Test that a WSM with an obj is passed through verbatim.
-    //
-    class FetchStageAlreadyFetched : public QueryStageFetchBase {
-    public:
-        void run() {
-            OperationContextImpl txn;
-            Client::WriteContext ctx(&txn, ns());
+        // No more data to fetch, so, EOF.
+        state = fetchStage->work(&id);
+        ASSERT_EQUALS(PlanStage::IS_EOF, state);
+    }
+};
 
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&txn, ns());
-            if (!coll) {
-                coll = db->createCollection(&txn, ns());
-            }
-            WorkingSet ws;
+class All : public Suite {
+public:
+    All() : Suite("query_stage_fetch") {}
 
-            // Add an object to the DB.
-            insert(BSON("foo" << 5));
-            set<DiskLoc> locs;
-            getLocs(&locs, coll);
-            ASSERT_EQUALS(size_t(1), locs.size());
-            ctx.commit();
+    void setupTests() {
+        add<FetchStageAlreadyFetched>();
+        add<FetchStageFilter>();
+    }
+};
 
-            // Create a mock stage that returns the WSM.
-            auto_ptr<MockStage> mockStage(new MockStage(&ws));
-
-            // Mock data.
-            {
-                WorkingSetMember mockMember;
-                mockMember.state = WorkingSetMember::LOC_AND_UNOWNED_OBJ;
-                mockMember.loc = *locs.begin();
-                mockMember.obj = coll->docFor(mockMember.loc);
-                // Points into our DB.
-                ASSERT_FALSE(mockMember.obj.isOwned());
-                mockStage->pushBack(mockMember);
-
-                mockMember.state = WorkingSetMember::OWNED_OBJ;
-                mockMember.loc = DiskLoc();
-                mockMember.obj = BSON("foo" << 6);
-                ASSERT_TRUE(mockMember.obj.isOwned());
-                mockStage->pushBack(mockMember);
-            }
-
-            auto_ptr<FetchStage> fetchStage(new FetchStage(&ws, mockStage.release(), NULL, coll));
-
-            WorkingSetID id = WorkingSet::INVALID_ID;
-            PlanStage::StageState state;
-
-            // Don't bother doing any fetching if an obj exists already.
-            state = fetchStage->work(&id);
-            ASSERT_EQUALS(PlanStage::ADVANCED, state);
-            state = fetchStage->work(&id);
-            ASSERT_EQUALS(PlanStage::ADVANCED, state);
-
-            // No more data to fetch, so, EOF.
-            state = fetchStage->work(&id);
-            ASSERT_EQUALS(PlanStage::IS_EOF, state);
-        }
-    };
-
-    //
-    // Test matching with fetch.
-    //
-    class FetchStageFilter : public QueryStageFetchBase {
-    public:
-        void run() {
-            OperationContextImpl txn;
-            Client::WriteContext ctx(&txn, ns());
-
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&txn, ns());
-            if (!coll) {
-                coll = db->createCollection(&txn, ns());
-            }
-            WorkingSet ws;
-
-            // Add an object to the DB.
-            insert(BSON("foo" << 5));
-            set<DiskLoc> locs;
-            getLocs(&locs, coll);
-            ASSERT_EQUALS(size_t(1), locs.size());
-
-            // Create a mock stage that returns the WSM.
-            auto_ptr<MockStage> mockStage(new MockStage(&ws));
-
-            // Mock data.
-            {
-                WorkingSetMember mockMember;
-                mockMember.state = WorkingSetMember::LOC_AND_IDX;
-                mockMember.loc = *locs.begin();
-
-                // State is loc and index, shouldn't be able to get the foo data inside.
-                BSONElement elt;
-                ASSERT_FALSE(mockMember.getFieldDotted("foo", &elt));
-                mockStage->pushBack(mockMember);
-            }
-
-            // Make the filter.
-            BSONObj filterObj = BSON("foo" << 6);
-            StatusWithMatchExpression swme = MatchExpressionParser::parse(filterObj);
-            verify(swme.isOK());
-            auto_ptr<MatchExpression> filterExpr(swme.getValue());
-
-            // Matcher requires that foo==6 but we only have data with foo==5.
-            auto_ptr<FetchStage> fetchStage(
-                new FetchStage(&ws, mockStage.release(), filterExpr.get(), coll));
-
-            // First call should return a fetch request as it's not in memory.
-            WorkingSetID id = WorkingSet::INVALID_ID;
-            PlanStage::StageState state;
-
-            // Normally we'd return the object but we have a filter that prevents it.
-            state = fetchStage->work(&id);
-            ASSERT_EQUALS(PlanStage::NEED_TIME, state);
-
-            // No more data to fetch, so, EOF.
-            state = fetchStage->work(&id);
-            ASSERT_EQUALS(PlanStage::IS_EOF, state);
-            ctx.commit();
-        }
-    };
-
-    class All : public Suite {
-    public:
-        All() : Suite( "query_stage_fetch" ) { }
-
-        void setupTests() {
-            add<FetchStageAlreadyFetched>();
-            add<FetchStageFilter>();
-        }
-    }  queryStageFetchAll;
+SuiteInstance<All> queryStageFetchAll;
 
 }  // namespace QueryStageFetch

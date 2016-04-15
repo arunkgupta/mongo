@@ -26,6 +26,7 @@
  *    then also delete it in the license file.
  */
 
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/util/assert_util.h"
@@ -36,74 +37,82 @@ using mongo::MsgAssertionException;
  * Test getLastError client handling
  */
 namespace {
-    static const char* const _ns = "unittests.gle";
 
-    /**
-     * Verify that when the command fails we get back an error message.
-     */
-    class GetLastErrorCommandFailure {
-    public:
-        void run() {
-            OperationContextImpl txn;
-            DBDirectClient client(&txn);
+using std::string;
 
-            client.insert(_ns, BSON( "test" << "test"));
+static const char* const _ns = "unittests.gle";
 
-            // Cannot mix fsync + j, will make command fail
-            string gleString = client.getLastError(true, true, 10, 10);
-            ASSERT_NOT_EQUALS(gleString, "");
-        }
-    };
+/**
+ * Verify that when the command fails we get back an error message.
+ */
+class GetLastErrorCommandFailure {
+public:
+    void run() {
+        OperationContextImpl txn;
+        DBDirectClient client(&txn);
 
-    /**
-     * Verify that the write succeeds
-     */
-    class GetLastErrorClean {
-    public:
-        void run() {
-            OperationContextImpl txn;
-            DBDirectClient client(&txn);
+        client.insert(_ns,
+                      BSON("test"
+                           << "test"));
 
-            client.insert(_ns, BSON( "test" << "test"));
+        // Cannot mix fsync + j, will make command fail
+        string gleString = client.getLastError(true, true, 10, 10);
+        ASSERT_NOT_EQUALS(gleString, "");
+    }
+};
 
-            // Make sure there was no error
-            string gleString = client.getLastError();
-            ASSERT_EQUALS(gleString, "");
-        }
-    };
+/**
+ * Verify that the write succeeds
+ */
+class GetLastErrorClean {
+public:
+    void run() {
+        OperationContextImpl txn;
+        DBDirectClient client(&txn);
 
-    /**
-     * Verify that the write succeed first, then error on dup
-     */
-    class GetLastErrorFromDup {
-    public:
-        void run() {
-            OperationContextImpl txn;
-            DBDirectClient client(&txn);
+        client.insert(_ns,
+                      BSON("test"
+                           << "test"));
 
-            client.insert(_ns, BSON( "_id" << 1));
+        // Make sure there was no error
+        string gleString = client.getLastError();
+        ASSERT_EQUALS(gleString, "");
+    }
+};
 
-            // Make sure there was no error
-            string gleString = client.getLastError();
-            ASSERT_EQUALS(gleString, "");
+/**
+ * Verify that the write succeed first, then error on dup
+ */
+class GetLastErrorFromDup {
+public:
+    void run() {
+        OperationContextImpl txn;
+        DBDirectClient client(&txn);
 
-            //insert dup
-            client.insert(_ns, BSON( "_id" << 1));
-            // Make sure there was an error
-            gleString = client.getLastError();
-            ASSERT_NOT_EQUALS(gleString, "");
-        }
-    };
+        client.insert(_ns, BSON("_id" << 1));
 
-    class All : public Suite {
-    public:
-        All() : Suite( "gle" ) {
-        }
+        // Make sure there was no error
+        string gleString = client.getLastError();
+        ASSERT_EQUALS(gleString, "");
 
-        void setupTests() {
-            add< GetLastErrorClean >();
-            add< GetLastErrorCommandFailure >();
-            add< GetLastErrorFromDup >();
-        }
-    } myall;
+        // insert dup
+        client.insert(_ns, BSON("_id" << 1));
+        // Make sure there was an error
+        gleString = client.getLastError();
+        ASSERT_NOT_EQUALS(gleString, "");
+    }
+};
+
+class All : public Suite {
+public:
+    All() : Suite("gle") {}
+
+    void setupTests() {
+        add<GetLastErrorClean>();
+        add<GetLastErrorCommandFailure>();
+        add<GetLastErrorFromDup>();
+    }
+};
+
+SuiteInstance<All> myall;
 }

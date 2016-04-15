@@ -35,57 +35,73 @@
 
 #include "mongo/db/storage/mmap_v1/dur_journalformat.h"
 #include "mongo/util/concurrency/mutex.h"
-#include "mongo/util/file.h"
 
 namespace mongo {
-    class DurableMappedFile;
 
-    namespace dur {
-        struct ParsedJournalEntry;
+class DurableMappedFile;
 
-        /** call go() to execute a recovery from existing journal files.
-         */
-        class RecoveryJob : boost::noncopyable {
-            static class Last {
-            public:
-                Last();
-                DurableMappedFile* newEntry(const ParsedJournalEntry&, RecoveryJob&);
-            private:
-                DurableMappedFile *mmf;
-                std::string dbName;
-                int fileNo;
-            } last;        
-        public:
-            RecoveryJob() : _lastDataSyncedFromLastRun(0), 
-                _mx("recovery"), _recovering(false) { _lastSeqMentionedInConsoleLog = 1; }
-            void go(std::vector<boost::filesystem::path>& files);
-            ~RecoveryJob();
+namespace dur {
 
-            /** @param data data between header and footer. compressed if recovering. */
-            void processSection(const JSectHeader *h, const void *data, unsigned len, const JSectFooter *f);
+struct ParsedJournalEntry;
 
-            void close(); // locks and calls _close()
+/** call go() to execute a recovery from existing journal files.
+ */
+class RecoveryJob {
+    MONGO_DISALLOW_COPYING(RecoveryJob);
 
-            static RecoveryJob & get() { return _instance; }
-        private:
-            void write(Last& last, const ParsedJournalEntry& entry); // actually writes to the file
-            void applyEntry(Last& last, const ParsedJournalEntry& entry, bool apply, bool dump);
-            void applyEntries(const std::vector<ParsedJournalEntry> &entries);
-            bool processFileBuffer(const void *, unsigned len);
-            bool processFile(boost::filesystem::path journalfile);
-            void _close(); // doesn't lock
-            DurableMappedFile* getDurableMappedFile(const ParsedJournalEntry& entry);
+public:
+    RecoveryJob();
+    ~RecoveryJob();
 
-            std::list<boost::shared_ptr<DurableMappedFile> > _mmfs;
+    void go(std::vector<boost::filesystem::path>& files);
 
-            unsigned long long _lastDataSyncedFromLastRun;
-            unsigned long long _lastSeqMentionedInConsoleLog;
-        public:
-            mongo::mutex _mx; // protects _mmfs
-        private:
-            bool _recovering; // are we in recovery or WRITETODATAFILES
+    /** @param data data between header and footer. compressed if recovering. */
+    void processSection(const JSectHeader* h, const void* data, unsigned len, const JSectFooter* f);
 
-            static RecoveryJob &_instance;
-        };
+    // locks and calls _close()
+    void close();
+
+    static RecoveryJob& get() {
+        return _instance;
     }
+
+private:
+    class Last {
+    public:
+        Last();
+        DurableMappedFile* newEntry(const ParsedJournalEntry&, RecoveryJob&);
+
+    private:
+        DurableMappedFile* mmf;
+        std::string dbName;
+        int fileNo;
+    };
+
+
+    void write(Last& last, const ParsedJournalEntry& entry);  // actually writes to the file
+    void applyEntry(Last& last, const ParsedJournalEntry& entry, bool apply, bool dump);
+    void applyEntries(const std::vector<ParsedJournalEntry>& entries);
+    bool processFileBuffer(const void*, unsigned len);
+    bool processFile(boost::filesystem::path journalfile);
+    void _close();  // doesn't lock
+
+
+    // Set of memory mapped files and a mutex to protect them
+    stdx::mutex _mx;
+    std::list<std::shared_ptr<DurableMappedFile>> _mmfs;
+
+    // Are we in recovery or WRITETODATAFILES
+    bool _recovering;
+
+    unsigned long long _lastDataSyncedFromLastRun;
+    unsigned long long _lastSeqSkipped;
+    bool _appliedAnySections;
+
+
+    static RecoveryJob& _instance;
+};
+
+
+void replayJournalFilesAtStartup();
+}
 }

@@ -28,99 +28,104 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
 #include <string>
 
+#include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
+class CollatorInterface;
+class MatchExpression;
+
+/**
+ * This name sucks, but every name involving 'index' is used somewhere.
+ */
+struct IndexEntry {
     /**
-     * This name sucks, but every name involving 'index' is used somewhere.
+     * Use this constructor if you're making an IndexEntry from the catalog.
      */
-    struct IndexEntry {
-        /**
-         * Use this constructor if you're making an IndexEntry from the catalog.
-         */
-        IndexEntry(const BSONObj& kp,
-                   const std::string& accessMethod,
-                   bool mk,
-                   bool sp,
-                   const std::string& n,
-                   const BSONObj& io)
-            : keyPattern(kp),
-              multikey(mk),
-              sparse(sp),
-              name(n),
-              infoObj(io) {
+    IndexEntry(const BSONObj& kp,
+               const std::string& accessMethod,
+               bool mk,
+               bool sp,
+               bool unq,
+               const std::string& n,
+               const MatchExpression* fe,
+               const BSONObj& io)
+        : keyPattern(kp),
+          multikey(mk),
+          sparse(sp),
+          unique(unq),
+          name(n),
+          filterExpr(fe),
+          infoObj(io) {
+        type = IndexNames::nameToType(accessMethod);
+    }
 
-            type = IndexNames::nameToType(accessMethod);
-        }
+    /**
+     * For testing purposes only.
+     */
+    IndexEntry(const BSONObj& kp,
+               bool mk,
+               bool sp,
+               bool unq,
+               const std::string& n,
+               const MatchExpression* fe,
+               const BSONObj& io)
+        : keyPattern(kp),
+          multikey(mk),
+          sparse(sp),
+          unique(unq),
+          name(n),
+          filterExpr(fe),
+          infoObj(io) {
+        type = IndexNames::nameToType(IndexNames::findPluginName(keyPattern));
+    }
 
-        /**
-         * For testing purposes only.
-         */
-        IndexEntry(const BSONObj& kp,
-                   bool mk,
-                   bool sp,
-                   const std::string& n,
-                   const BSONObj& io)
-            : keyPattern(kp),
-              multikey(mk),
-              sparse(sp),
-              name(n),
-              infoObj(io) {
+    /**
+     * For testing purposes only.
+     */
+    IndexEntry(const BSONObj& kp)
+        : keyPattern(kp),
+          multikey(false),
+          sparse(false),
+          unique(false),
+          name("test_foo"),
+          filterExpr(nullptr),
+          infoObj(BSONObj()) {
+        type = IndexNames::nameToType(IndexNames::findPluginName(keyPattern));
+    }
 
-            type = IndexNames::nameToType(IndexNames::findPluginName(keyPattern));
-        }     
+    std::string toString() const;
 
-        /**
-         * For testing purposes only.
-         */
-        IndexEntry(const BSONObj& kp)
-            : keyPattern(kp),
-              multikey(false),
-              sparse(false),
-              name("test_foo"),
-              infoObj(BSONObj()) {
+    BSONObj keyPattern;
 
-            type = IndexNames::nameToType(IndexNames::findPluginName(keyPattern));
-        }     
+    bool multikey;
 
-        BSONObj keyPattern;
+    boost::optional<MultikeyPaths> multikeyPaths;
 
-        bool multikey;
+    bool sparse;
 
-        bool sparse;
+    bool unique;
 
-        std::string name;
+    std::string name;
 
-        // Geo indices have extra parameters.  We need those available to plan correctly.
-        BSONObj infoObj;
+    const MatchExpression* filterExpr;
 
-        // What type of index is this?  (What access method can we use on the index described
-        // by the keyPattern?)
-        IndexType type;
+    // Geo indices have extra parameters.  We need those available to plan correctly.
+    BSONObj infoObj;
 
-        std::string toString() const {
-            mongoutils::str::stream ss;
-            ss << "kp: "  << keyPattern.toString();
+    // What type of index is this?  (What access method can we use on the index described
+    // by the keyPattern?)
+    IndexType type;
 
-            if (multikey) {
-                ss << " multikey";
-            }
-
-            if (sparse) {
-                ss << " sparse";
-            }
-
-            if (!infoObj.isEmpty()) {
-                ss << " io: " << infoObj.toString();
-            }
-
-            return ss;
-        }
-    };
+    // Null if this index orders strings according to the simple binary compare. If non-null,
+    // represents the collator used to generate index keys for indexed strings.
+    CollatorInterface* collator = nullptr;
+};
 
 }  // namespace mongo

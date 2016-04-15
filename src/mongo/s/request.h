@@ -27,79 +27,67 @@
  *    then also delete it in the license file.
  */
 
-
 #pragma once
 
-#include "mongo/pch.h"
-
 #include "mongo/db/dbmessage.h"
-#include "mongo/s/config.h"
 #include "mongo/util/net/message.h"
 
 namespace mongo {
 
+class Client;
+class OperationContext;
 
-    class OpCounters;
-    class ClientInfo;
-    class OperationContext;
+class Request {
+    MONGO_DISALLOW_COPYING(Request);
 
+public:
+    Request(Message& m, AbstractMessagingPort* p);
 
-    class Request : boost::noncopyable {
-    public:
-        Request( Message& m, AbstractMessagingPort* p );
+    const char* getns() const {
+        return _d.getns();
+    }
 
-        // ---- message info -----
+    const char* getnsIfPresent() const {
+        return _d.messageShouldHaveNs() ? _d.getns() : "";
+    }
 
+    int op() const {
+        return _m.operation();
+    }
 
-        const char * getns() const {
-            return _d.getns();
-        }
-        int op() const {
-            return _m.operation();
-        }
-        bool expectResponse() const {
-            return op() == dbQuery || op() == dbGetMore;
-        }
-        bool isCommand() const;
+    bool expectResponse() const {
+        return op() == dbQuery || op() == dbGetMore;
+    }
 
-        MSGID id() const {
-            return _id;
-        }
+    bool isCommand() const;
 
-        ClientInfo * getClientInfo() const {
-            return _clientInfo;
-        }
+    int32_t id() const {
+        return _id;
+    }
 
-        // ---- low level access ----
+    Message& m() {
+        return _m;
+    }
+    DbMessage& d() {
+        return _d;
+    }
+    AbstractMessagingPort* p() const {
+        return _p;
+    }
 
-        void reply( Message & response , const std::string& fromServer );
+    void process(OperationContext* txn, int attempt = 0);
 
-        Message& m() { return _m; }
-        DbMessage& d() { return _d; }
-        AbstractMessagingPort* p() const { return _p; }
+    void init(OperationContext* txn);
 
-        void process( int attempt = 0 );
+private:
+    Client* const _clientInfo;
 
-        void init();
+    Message& _m;
+    DbMessage _d;
+    AbstractMessagingPort* const _p;
 
-        void reset();
+    int32_t _id;
 
-    private:
-        Message& _m;
-        DbMessage _d;
-        AbstractMessagingPort* _p;
-
-        MSGID _id;
-
-        ClientInfo * _clientInfo;
-
-        OpCounters* _counter;
-
-        boost::scoped_ptr<OperationContext> _txn;
-
-        bool _didInit;
-    };
-
+    bool _didInit;
+};
 }
-
-#include "strategy.h"

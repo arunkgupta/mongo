@@ -33,34 +33,31 @@
 #include "mongo/base/status.h"
 #include "mongo/db/hasher.h"  // For HashSeed.
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/index/btree_based_access_method.h"
+#include "mongo/db/index/index_access_method.h"
 #include "mongo/db/jsobj.h"
 
 namespace mongo {
 
-    /**
-     * This is the access method for "hashed" indices.
-     */
-    class HashAccessMethod : public BtreeBasedAccessMethod {
-    public:
-        using BtreeBasedAccessMethod::_descriptor;
+/**
+ * This is the access method for "hashed" indices.
+ */
+class HashAccessMethod : public IndexAccessMethod {
+public:
+    HashAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree);
 
-        HashAccessMethod(IndexCatalogEntry* btreeState, BtreeInterface* btree);
-        virtual ~HashAccessMethod() { }
+private:
+    virtual void getKeys(const BSONObj& obj, BSONObjSet* keys) const;
 
-    private:
-        virtual void getKeys(const BSONObj& obj, BSONObjSet* keys);
+    // Only one of our fields is hashed.  This is the field name for it.
+    std::string _hashedField;
 
-        // Only one of our fields is hashed.  This is the field name for it.
-        std::string _hashedField;
+    // _seed defaults to zero.
+    HashSeed _seed;
 
-        // _seed defaults to zero.
-        HashSeed _seed;
+    // _hashVersion defaults to zero.
+    int _hashVersion;
 
-        // _hashVersion defaults to zero.
-        int _hashVersion;
-
-        BSONObj _missingKey;
-    };
+    BSONObj _missingKey;
+};
 
 }  // namespace mongo

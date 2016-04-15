@@ -26,7 +26,9 @@
 *    it in the license file.
 */
 
-#include "mongo/pch.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+
+#include "mongo/platform/basic.h"
 
 #include "mongo/base/init.h"
 #include "mongo/base/status.h"
@@ -36,6 +38,7 @@
 #include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/cloner.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/copydb.h"
@@ -47,100 +50,114 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/isself.h"
-#include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/oplogreader.h"
 #include "mongo/db/operation_context_impl.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/ops/insert.h"
+#include "mongo/db/storage/storage_options.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 
-    class CmdCloneCollection : public Command {
-    public:
-        CmdCloneCollection() : Command("cloneCollection") { }
+using std::unique_ptr;
+using std::string;
+using std::stringstream;
+using std::endl;
 
-        virtual bool slaveOk() const {
+class CmdCloneCollection : public Command {
+public:
+    CmdCloneCollection() : Command("cloneCollection") {}
+
+    virtual bool slaveOk() const {
+        return false;
+    }
+
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
+
+    virtual std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const {
+        return parseNsFullyQualified(dbname, cmdObj);
+    }
+
+    virtual Status checkAuthForCommand(ClientBasic* client,
+                                       const std::string& dbname,
+                                       const BSONObj& cmdObj) {
+        std::string ns = parseNs(dbname, cmdObj);
+
+        ActionSet actions;
+        actions.addAction(ActionType::insert);
+        actions.addAction(ActionType::createIndex);  // SERVER-11418
+        if (shouldBypassDocumentValidationForCommand(cmdObj)) {
+            actions.addAction(ActionType::bypassDocumentValidation);
+        }
+
+        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
+                ResourcePattern::forExactNamespace(NamespaceString(ns)), actions)) {
+            return Status(ErrorCodes::Unauthorized, "Unauthorized");
+        }
+        return Status::OK();
+    }
+
+    virtual void help(stringstream& help) const {
+        help << "{ cloneCollection: <collection>, from: <host> [,query: <query_filter>] "
+                "[,copyIndexes:<bool>] }"
+                "\nCopies a collection from one server to another. Do not use on a single server "
+                "as the destination "
+                "is placed at the same db.collection (namespace) as the source.\n";
+    }
+
+    virtual bool run(OperationContext* txn,
+                     const string& dbname,
+                     BSONObj& cmdObj,
+                     int,
+                     string& errmsg,
+                     BSONObjBuilder& result) {
+        boost::optional<DisableDocumentValidation> maybeDisableValidation;
+        if (shouldBypassDocumentValidationForCommand(cmdObj))
+            maybeDisableValidation.emplace(txn);
+
+        string fromhost = cmdObj.getStringField("from");
+        if (fromhost.empty()) {
+            errmsg = "missing 'from' parameter";
             return false;
         }
 
-        virtual bool isWriteCommandForConfigServer() const {
+        {
+            HostAndPort h(fromhost);
+            if (repl::isSelf(h)) {
+                errmsg = "can't cloneCollection from self";
+                return false;
+            }
+        }
+
+        string collection = parseNs(dbname, cmdObj);
+        Status allowedWriteStatus = userAllowedWriteNS(dbname, collection);
+        if (!allowedWriteStatus.isOK()) {
+            return appendCommandStatus(result, allowedWriteStatus);
+        }
+
+        BSONObj query = cmdObj.getObjectField("query");
+        if (query.isEmpty())
+            query = BSONObj();
+
+        BSONElement copyIndexesSpec = cmdObj.getField("copyindexes");
+        bool copyIndexes = copyIndexesSpec.isBoolean() ? copyIndexesSpec.boolean() : true;
+
+        log() << "cloneCollection.  db:" << dbname << " collection:" << collection
+              << " from: " << fromhost << " query: " << query << " "
+              << (copyIndexes ? "" : ", not copying indexes") << endl;
+
+        Cloner cloner;
+        unique_ptr<DBClientConnection> myconn;
+        myconn.reset(new DBClientConnection());
+        if (!myconn->connect(HostAndPort(fromhost), errmsg))
             return false;
-        }
 
-        virtual std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const {
-            return parseNsFullyQualified(dbname, cmdObj);
-        }
+        cloner.setConnection(myconn.release());
 
-        virtual Status checkAuthForCommand(ClientBasic* client,
-                                           const std::string& dbname,
-                                           const BSONObj& cmdObj) {
-            std::string ns = parseNs(dbname, cmdObj);
+        return cloner.copyCollection(txn, collection, query, errmsg, copyIndexes);
+    }
 
-            ActionSet actions;
-            actions.addAction(ActionType::insert);
-            actions.addAction(ActionType::createIndex); // SERVER-11418
+} cmdCloneCollection;
 
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
-                    ResourcePattern::forExactNamespace(NamespaceString(ns)), actions)) {
-                return Status(ErrorCodes::Unauthorized, "Unauthorized");
-            }
-            return Status::OK();
-        }
-
-        virtual void help( stringstream &help ) const {
-            help << "{ cloneCollection: <collection>, from: <host> [,query: <query_filter>] [,copyIndexes:<bool>] }"
-                 "\nCopies a collection from one server to another. Do not use on a single server as the destination "
-                 "is placed at the same db.collection (namespace) as the source.\n"
-                 ;
-        }
-
-        virtual bool run(OperationContext* txn,
-                         const string& dbname,
-                         BSONObj& cmdObj,
-                         int,
-                         string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
-
-            string fromhost = cmdObj.getStringField("from");
-            if ( fromhost.empty() ) {
-                errmsg = "missing 'from' parameter";
-                return false;
-            }
-
-            {
-                HostAndPort h(fromhost);
-                if (repl::isSelf(h)) {
-                    errmsg = "can't cloneCollection from self";
-                    return false;
-                }
-            }
-
-            string collection = parseNs(dbname, cmdObj);
-            if ( collection.empty() ) {
-                errmsg = "bad 'cloneCollection' value";
-                return false;
-            }
-            BSONObj query = cmdObj.getObjectField("query");
-            if ( query.isEmpty() )
-                query = BSONObj();
-
-            BSONElement copyIndexesSpec = cmdObj.getField("copyindexes");
-            bool copyIndexes = copyIndexesSpec.isBoolean() ? copyIndexesSpec.boolean() : true;
-
-            log() << "cloneCollection.  db:" << dbname << " collection:" << collection << " from: " << fromhost
-                  << " query: " << query << " " << ( copyIndexes ? "" : ", not copying indexes" ) << endl;
-
-            Cloner cloner;
-            auto_ptr<DBClientConnection> myconn;
-            myconn.reset( new DBClientConnection() );
-            if ( ! myconn->connect( HostAndPort(fromhost) , errmsg ) )
-                return false;
-
-            cloner.setConnection( myconn.release() );
-
-            return cloner.copyCollection(txn, collection, query, errmsg, true, false, copyIndexes);
-        }
-
-    } cmdCloneCollection;
-
-} // namespace mongo
+}  // namespace mongo

@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2013 10gen Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -28,97 +28,90 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
 
 #include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/diskloc.h"
-#include "mongo/db/index/btree_index_cursor.h"
-#include "mongo/db/index/index_access_method.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/matcher/expression.h"
-#include "mongo/platform/unordered_set.h"
+#include "mongo/db/query/count_request.h"
 
 namespace mongo {
 
-    class IndexAccessMethod;
-    class IndexDescriptor;
-    class WorkingSet;
+struct CountStageParams {
+    CountStageParams(const CountRequest& request, bool useRecordStoreCount)
+        : nss(request.getNs()),
+          limit(request.getLimit()),
+          skip(request.getSkip()),
+          useRecordStoreCount(useRecordStoreCount) {}
 
-    struct CountParams {
-        CountParams() : descriptor(NULL) { }
+    // Namespace to operate on (e.g. "foo.bar").
+    NamespaceString nss;
 
-        // What index are we traversing?
-        const IndexDescriptor* descriptor;
+    // An integer limiting the number of documents to count. 0 means no limit.
+    long long limit;
 
-        BSONObj startKey;
-        bool startKeyInclusive;
+    // An integer indicating to not include the first n documents in the count. 0 means no skip.
+    long long skip;
 
-        BSONObj endKey;
-        bool endKeyInclusive;
-    };
+    // True if this count stage should just ask the record store for a count instead of computing
+    // one itself.
+    //
+    // Note: This strategy can lead to inaccurate counts on certain storage engines (including
+    // WiredTiger).
+    bool useRecordStoreCount;
+};
 
+/**
+ * Stage used by the count command. This stage sits at the root of a plan tree
+ * and counts the number of results returned by its child stage.
+ *
+ * This should not be confused with the CountScan stage. CountScan is a special
+ * index access stage which can optimize index access for count operations in
+ * some cases. On the other hand, *every* count op has a CountStage at its root.
+ *
+ * Only returns NEED_TIME until hitting EOF. The count result can be obtained by examining
+ * the specific stats.
+ */
+class CountStage final : public PlanStage {
+public:
+    CountStage(OperationContext* txn,
+               Collection* collection,
+               CountStageParams params,
+               WorkingSet* ws,
+               PlanStage* child);
+
+    bool isEOF() final;
+    StageState doWork(WorkingSetID* out) final;
+
+    StageType stageType() const final {
+        return STAGE_COUNT;
+    }
+
+    std::unique_ptr<PlanStageStats> getStats();
+
+    const SpecificStats* getSpecificStats() const final;
+
+    static const char* kStageType;
+
+private:
     /**
-     * Used by the count command.  Scans an index from a start key to an end key.  Does not create
-     * any WorkingSetMember(s) for any of the data, instead returning ADVANCED to indicate to the
-     * caller that another result should be counted.
+     * Asks the record store for the count, applying the skip and limit if necessary. The result is
+     * stored in '_specificStats'.
      *
-     * Only created through the getRunnerCount path, as count is the only operation that doesn't
-     * care about its data.
+     * This is only valid if the query and hint are both empty.
      */
-    class Count : public PlanStage {
-    public:
-        Count(const CountParams& params, WorkingSet* workingSet);
-        virtual ~Count() { }
+    void recordStoreCount();
 
-        virtual StageState work(WorkingSetID* out);
-        virtual bool isEOF();
-        virtual void prepareToYield();
-        virtual void recoverFromYield();
-        virtual void invalidate(const DiskLoc& dl, InvalidationType type);
+    // The collection over which we are counting.
+    Collection* _collection;
 
-        virtual std::vector<PlanStage*> getChildren() const;
+    CountStageParams _params;
 
-        virtual StageType stageType() const { return STAGE_COUNT; }
+    // The number of documents that we still need to skip.
+    long long _leftToSkip;
 
-        virtual PlanStageStats* getStats();
+    // The working set used to pass intermediate results between stages. Not owned
+    // by us.
+    WorkingSet* _ws;
 
-        static const char* kStageType;
-
-    private:
-        /**
-         * Initialize the underlying IndexCursor
-         */
-        void initIndexCursor();
-
-        /**
-         * See if we've hit the end yet.
-         */
-        void checkEnd();
-
-        // The WorkingSet we annotate with results.  Not owned by us.
-        WorkingSet* _workingSet;
-
-        // Index access.  Both pointers below are owned by Collection -> IndexCatalog.
-        const IndexDescriptor* _descriptor;
-        const IndexAccessMethod* _iam;
-
-        // Our start cursor is _btreeCursor.
-        boost::scoped_ptr<BtreeIndexCursor> _btreeCursor;
-
-        // Our end marker.
-        boost::scoped_ptr<BtreeIndexCursor> _endCursor;
-
-        // Could our index have duplicates?  If so, we use _returned to dedup.
-        unordered_set<DiskLoc, DiskLoc::Hasher> _returned;
-
-        CountParams _params;
-
-        bool _hitEnd;
-
-        bool _shouldDedup;
-
-        CommonStats _commonStats;
-        CountStats _specificStats;
-    };
+    CountStats _specificStats;
+};
 
 }  // namespace mongo

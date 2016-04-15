@@ -28,48 +28,45 @@
 
 #pragma once
 
-#include "mongo/db/diskloc.h"
-#include "mongo/db/jsobj.h"
+
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/record_id.h"
 
 namespace mongo {
 
-    /**
-     * This stage implements skip functionality.  It drops the first 'toSkip' results from its child
-     * then returns the rest verbatim.
-     *
-     * Preconditions: None.
-     */
-    class SkipStage : public PlanStage {
-    public:
-        SkipStage(int toSkip, WorkingSet* ws, PlanStage* child);
-        virtual ~SkipStage();
+/**
+ * This stage implements skip functionality.  It drops the first 'toSkip' results from its child
+ * then returns the rest verbatim.
+ *
+ * Preconditions: None.
+ */
+class SkipStage final : public PlanStage {
+public:
+    SkipStage(OperationContext* opCtx, long long toSkip, WorkingSet* ws, PlanStage* child);
+    ~SkipStage();
 
-        virtual bool isEOF();
-        virtual StageState work(WorkingSetID* out);
+    bool isEOF() final;
+    StageState doWork(WorkingSetID* out) final;
 
-        virtual void prepareToYield();
-        virtual void recoverFromYield();
-        virtual void invalidate(const DiskLoc& dl, InvalidationType type);
+    StageType stageType() const final {
+        return STAGE_SKIP;
+    }
 
-        virtual std::vector<PlanStage*> getChildren() const;
+    std::unique_ptr<PlanStageStats> getStats() final;
 
-        virtual StageType stageType() const { return STAGE_SKIP; }
+    const SpecificStats* getSpecificStats() const final;
 
-        virtual PlanStageStats* getStats();
+    static const char* kStageType;
 
-        static const char* kStageType;
+private:
+    WorkingSet* _ws;
 
-    private:
-        WorkingSet* _ws;
-        scoped_ptr<PlanStage> _child;
+    // We drop the first _toSkip results that we would have returned.
+    long long _toSkip;
 
-        // We drop the first _toSkip results that we would have returned.
-        int _toSkip;
-
-        // Stats
-        CommonStats _commonStats;
-        SkipStats _specificStats;
-    };
+    // Stats
+    SkipStats _specificStats;
+};
 
 }  // namespace mongo

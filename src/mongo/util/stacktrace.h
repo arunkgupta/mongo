@@ -31,9 +31,7 @@
 
 #pragma once
 
-#include <iostream>
-
-#include "mongo/util/log.h"
+#include <iosfwd>
 
 #if defined(_WIN32)
 // We need to pick up a decl for CONTEXT. Forward declaring would be preferable, but it is
@@ -43,15 +41,17 @@
 
 namespace mongo {
 
-    // Print stack trace information to "os", default to the log stream.
-    void printStackTrace(std::ostream &os=log().stream());
+// Print stack trace information to "os", default to the log stream.
+void printStackTrace(std::ostream& os);
+void printStackTrace();
 
 #if defined(_WIN32)
-    // Print stack trace (using a specified stack context) to "os", default to the log stream.
-    void printWindowsStackTrace(CONTEXT &context, std::ostream &os=log().stream());
+// Print stack trace (using a specified stack context) to "os", default to the log stream.
+void printWindowsStackTrace(CONTEXT& context, std::ostream& os);
+void printWindowsStackTrace(CONTEXT& context);
 
-    // Print error message from C runtime followed by stack trace
-    int crtDebugCallback(int, char* originalMessage, int*);
+// Print error message from C runtime followed by stack trace
+int crtDebugCallback(int, char* originalMessage, int*);
 #endif
 
 }  // namespace mongo

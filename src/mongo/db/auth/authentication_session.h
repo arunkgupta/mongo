@@ -27,36 +27,53 @@
 
 #pragma once
 
+#include <memory>
+
 #include "mongo/base/disallow_copying.h"
 
 namespace mongo {
 
-    /**
-     * Abstract type representing an ongoing authentication session.
-     *
-     * An example subclass is MongoAuthenticationSession.
-     */
-    class AuthenticationSession {
-        MONGO_DISALLOW_COPYING(AuthenticationSession);
-    public:
-        enum SessionType {
-            SESSION_TYPE_MONGO,  // The mongo-specific challenge-response authentication mechanism.
-            SESSION_TYPE_SASL  // SASL authentication mechanism.
-        };
+class ClientBasic;
 
-        virtual ~AuthenticationSession() {}
+/**
+ * Abstract type representing an ongoing authentication session.
+ *
+ * An example subclass is MongoAuthenticationSession.
+ */
+class AuthenticationSession {
+    MONGO_DISALLOW_COPYING(AuthenticationSession);
 
-        /**
-         * Return an identifer of the type of session, so that a caller can safely cast it and
-         * extract the type-specific data stored within.
-         */
-        SessionType getType() const { return _sessionType; }
-
-    protected:
-        explicit AuthenticationSession(SessionType sessionType) : _sessionType(sessionType) {}
-
-    private:
-        const SessionType _sessionType;
+public:
+    enum SessionType {
+        SESSION_TYPE_MONGO,  // The mongo-specific challenge-response authentication mechanism.
+        SESSION_TYPE_SASL    // SASL authentication mechanism.
     };
+
+    /**
+     * Sets the authentication session for the given "client" to "newSession".
+     */
+    static void set(ClientBasic* client, std::unique_ptr<AuthenticationSession> newSession);
+
+    /**
+     * Swaps "client"'s current authentication session with "other".
+     */
+    static void swap(ClientBasic* client, std::unique_ptr<AuthenticationSession>& other);
+
+    virtual ~AuthenticationSession() = default;
+
+    /**
+     * Return an identifer of the type of session, so that a caller can safely cast it and
+     * extract the type-specific data stored within.
+     */
+    SessionType getType() const {
+        return _sessionType;
+    }
+
+protected:
+    explicit AuthenticationSession(SessionType sessionType) : _sessionType(sessionType) {}
+
+private:
+    const SessionType _sessionType;
+};
 
 }  // namespace mongo

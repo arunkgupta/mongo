@@ -33,22 +33,33 @@
 namespace mongo {
 namespace repl {
 
-    class BackgroundSyncInterface;
+class BackgroundSyncInterface;
+
+/**
+ * Initial clone and sync
+ */
+class InitialSync : public SyncTail {
+public:
+    virtual ~InitialSync();
+    InitialSync(BackgroundSyncInterface* q, MultiSyncApplyFunc func);
+
 
     /**
-     * Initial clone and sync
+     * applies up to endOpTime, fetching missing documents as needed.
      */
-    class InitialSync : public SyncTail {
-    public:
-        virtual ~InitialSync();
-        InitialSync(BackgroundSyncInterface *q);
+    void oplogApplication(OperationContext* txn, const OpTime& endOpTime);
 
-        /**
-         * Creates the initial oplog entry: applies applyGTEObj and writes it to the oplog.  Then
-         * this runs oplogApplySegment allowing recloning documents.
-         */
-        BSONObj oplogApplication(const BSONObj& applyGTEObj, const BSONObj& minValidObj);
-    };
+private:
+    /**
+     * Applies oplog entries until reaching "endOpTime".
+     *
+     * NOTE:Will not transition or check states
+     */
+    void _applyOplogUntil(OperationContext* txn, const OpTime& endOpTime);
+};
 
-} // namespace repl
-} // namespace mongo
+// Used for ReplSetTest testing.
+extern unsigned replSetForceInitialSyncFailure;
+
+}  // namespace repl
+}  // namespace mongo

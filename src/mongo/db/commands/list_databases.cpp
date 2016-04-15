@@ -33,88 +33,92 @@
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_engine.h"
 
 namespace mongo {
 
-    // XXX: remove and put into storage api
-    intmax_t dbSize( const string& database );
+using std::set;
+using std::string;
+using std::stringstream;
+using std::vector;
 
-    class CmdListDatabases : public Command {
-    public:
-        virtual bool slaveOk() const {
-            return true;
-        }
-        virtual bool slaveOverrideOk() const {
-            return true;
-        }
-        virtual bool adminOnly() const {
-            return true;
-        }
-        virtual bool isWriteCommandForConfigServer() const { return false; }
-        virtual void help( stringstream& help ) const { help << "list databases on this server"; }
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
-            ActionSet actions;
-            actions.addAction(ActionType::listDatabases);
-            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-        }
-        CmdListDatabases() : Command("listDatabases" , true ) {}
-        bool run(OperationContext* txn, const string& dbname , BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool /*fromRepl*/) {
-            vector< string > dbNames;
-            globalStorageEngine->listDatabases( &dbNames );
+// XXX: remove and put into storage api
+intmax_t dbSize(const string& database);
 
-            vector< BSONObj > dbInfos;
+class CmdListDatabases : public Command {
+public:
+    virtual bool slaveOk() const {
+        return false;
+    }
+    virtual bool slaveOverrideOk() const {
+        return true;
+    }
+    virtual bool adminOnly() const {
+        return true;
+    }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
+    virtual void help(stringstream& help) const {
+        help << "list databases on this server";
+    }
+    virtual void addRequiredPrivileges(const std::string& dbname,
+                                       const BSONObj& cmdObj,
+                                       std::vector<Privilege>* out) {
+        ActionSet actions;
+        actions.addAction(ActionType::listDatabases);
+        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
+    }
 
-            set<string> seen;
-            intmax_t totalSize = 0;
-            for ( vector< string >::iterator i = dbNames.begin(); i != dbNames.end(); ++i ) {
-                BSONObjBuilder b;
-                b.append( "name", *i );
+    CmdListDatabases() : Command("listDatabases", true) {}
 
-                intmax_t size = dbSize( i->c_str() );
-                b.append( "sizeOnDisk", (double) size );
-                totalSize += size;
+    bool run(OperationContext* txn,
+             const string& dbname,
+             BSONObj& jsobj,
+             int,
+             string& errmsg,
+             BSONObjBuilder& result) {
+        vector<string> dbNames;
+        StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
+        storageEngine->listDatabases(&dbNames);
 
-                {
-                    Client::ReadContext rc(txn, *i + ".system.namespaces");
-                    b.appendBool( "empty", rc.ctx().db()->getDatabaseCatalogEntry()->isEmpty() );
-                }
+        vector<BSONObj> dbInfos;
 
-                dbInfos.push_back( b.obj() );
+        set<string> seen;
+        intmax_t totalSize = 0;
+        for (vector<string>::iterator i = dbNames.begin(); i != dbNames.end(); ++i) {
+            const string& dbname = *i;
 
-                seen.insert( i->c_str() );
-            }
+            BSONObjBuilder b;
+            b.append("name", dbname);
 
-            set<string> allShortNames;
             {
-                Lock::GlobalRead lk(txn->lockState());
-                dbHolder().getAllShortNames(allShortNames);
-            }
+                ScopedTransaction transaction(txn, MODE_IS);
+                Lock::DBLock dbLock(txn->lockState(), dbname, MODE_IS);
 
-            for ( set<string>::iterator i = allShortNames.begin(); i != allShortNames.end(); i++ ) {
-                string name = *i;
-
-                if ( seen.count( name ) )
+                Database* db = dbHolder().get(txn, dbname);
+                if (!db)
                     continue;
 
-                BSONObjBuilder b;
-                b.append( "name" , name );
-                b.append( "sizeOnDisk" , (double)1.0 );
+                const DatabaseCatalogEntry* entry = db->getDatabaseCatalogEntry();
+                invariant(entry);
 
-                {
-                    Client::ReadContext ctx(txn, name);
-                    b.appendBool( "empty", ctx.ctx().db()->getDatabaseCatalogEntry()->isEmpty() );
-                }
+                int64_t size = entry->sizeOnDisk(txn);
+                b.append("sizeOnDisk", static_cast<double>(size));
+                totalSize += size;
 
-                dbInfos.push_back( b.obj() );
+                b.appendBool("empty", size == 0);
             }
 
-            result.append( "databases", dbInfos );
-            result.append( "totalSize", double( totalSize ) );
-            return true;
-        }
-    } cmdListDatabases;
+            dbInfos.push_back(b.obj());
 
+            seen.insert(i->c_str());
+        }
+
+        result.append("databases", dbInfos);
+        result.append("totalSize", double(totalSize));
+        return true;
+    }
+} cmdListDatabases;
 }

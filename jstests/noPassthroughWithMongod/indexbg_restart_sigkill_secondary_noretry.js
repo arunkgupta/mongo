@@ -1,6 +1,3 @@
-// SERVER-13922
-if (0) {
-
 // TODO: SERVER-13215 move test back to replSets suite.
 
 /**
@@ -17,7 +14,7 @@ if (0) {
  * Start with noIndexBuildRetry option, should *not* build index on secondary
  */
 
-(function () {
+(function() {
     var assert_trueTimeout = function(f, msg, timeout /*ms*/, interval) {
         var start = new Date();
         timeout = timeout || 30000;
@@ -31,12 +28,12 @@ if (0) {
             if (diff > timeout)
                 return;
             sleep(interval);
-        }   
+        }
     };
 
     // Set up replica set
-    var replTest = new ReplSetTest({ name: 'bgIndexNoRetry', nodes: 3, 
-                                     nodeOptions : {noIndexBuildRetry:""} });
+    var replTest = new ReplSetTest(
+        {name: 'bgIndexNoRetry', nodes: 3, nodeOptions: {noIndexBuildRetry: "", syncdelay: 1}});
     var nodenames = replTest.nodeList();
 
     // We can't use an arbiter as the third node because the -auth test tries to log on there
@@ -50,13 +47,16 @@ if (0) {
         return;
     }
 
-    replTest.initiate({"_id" : "bgIndexNoRetry",
-                       "members" : [
-                           {"_id" : 0, "host" : nodenames[0]},
-                           {"_id" : 1, "host" : nodenames[1]},
-                           {"_id" : 2, "host" : nodenames[2], arbiterOnly: true}]});
+    replTest.initiate({
+        "_id": "bgIndexNoRetry",
+        "members": [
+            {"_id": 0, "host": nodenames[0]},
+            {"_id": 1, "host": nodenames[1]},
+            {"_id": 2, "host": nodenames[2], arbiterOnly: true}
+        ]
+    });
 
-    var master = replTest.getMaster();
+    var master = replTest.getPrimary();
     var second = replTest.getSecondary();
 
     var secondId = replTest.getNodeId(second);
@@ -68,18 +68,18 @@ if (0) {
 
     jsTest.log("creating test data " + size + " documents");
     var bulk = masterDB.jstests_bgsec.initializeUnorderedBulkOp();
-    for( i = 0; i < size; ++i ) {
-        bulk.insert({ i : i });
+    for (i = 0; i < size; ++i) {
+        bulk.insert({i: i});
     }
     assert.writeOK(bulk.execute());
 
     jsTest.log("Starting background indexing");
-    masterDB.jstests_bgsec.ensureIndex( {i:1}, {background:true} );
-    assert.eq(2, masterDB.system.indexes.count( {ns:"bgIndexNoRetrySec.jstests_bgsec"} ) );
+    masterDB.jstests_bgsec.ensureIndex({i: 1}, {background: true});
+    assert.eq(2, masterDB.jstests_bgsec.getIndexes().length);
 
     // Do one more write, so that later on, the secondary doesn't restart with the index build
     // as the last op in the oplog -- it will redo this op otherwise.
-    masterDB.jstests_bgsec.insert( { i : -1 } );
+    masterDB.jstests_bgsec.insert({i: -1});
 
     // Wait for the secondary to get caught up
     jsTest.log("Waiting for replication");
@@ -87,31 +87,26 @@ if (0) {
 
     // Make sure a journal flush for the oplog occurs, by doing a local journaled write to the
     // secondary
-    assert.writeOK(second.getDB('local').foo.insert({ a: 1 }, { writeConcern: { j: true }}));
+    assert.writeOK(second.getDB('local').foo.insert({a: 1}, {writeConcern: {j: true}}));
 
     // restart secondary and reconnect
     jsTest.log("Restarting secondary");
-    replTest.restart(secondId, {}, /*signal=*/ 9,  /*wait=*/true);
+    replTest.restart(secondId, {}, /*signal=*/9, /*wait=*/true);
 
     // Make sure secondary comes back
-    assert.soon( function() { 
+    assert.soon(function() {
         try {
-            secondDB.system.namespaces.count(); // trigger a reconnect if needed
-            return true; 
+            secondDB.isMaster();  // trigger a reconnect if needed
+            return true;
         } catch (e) {
-            return false; 
+            return false;
         }
-    } , "secondary didn't restart", 60000, 1000);
+    }, "secondary didn't restart", 60000, 1000);
 
-    assert_trueTimeout( 
-        function() { 
-            return 2 == secondDB.system.indexes.count( {ns:"bgIndexNoRetrySec.jstests_bgsec"} ); 
-        },
-        "index created on secondary after restart with --noIndexBuildRetry", 
-        30000, 200);
+    assert_trueTimeout(function() {
+        return 2 == secondDB.jstests_bgsec.getIndexes().length;
+    }, "index created on secondary after restart with --noIndexBuildRetry", 30000, 200);
 
-    assert.neq(2, secondDB.system.indexes.count( {ns:"bgIndexNoRetrySec.jstests_bgsec"} ));
+    assert.neq(2, secondDB.jstests_bgsec.getIndexes().length);
     replTest.stopSet();
 }());
-
-}  // if(0)

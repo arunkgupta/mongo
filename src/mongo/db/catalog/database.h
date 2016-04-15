@@ -30,148 +30,208 @@
 
 #pragma once
 
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/storage_options.h"
-#include "mongo/util/concurrency/mutex.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
 
-    class Collection;
-    class DataFile;
-    class DatabaseCatalogEntry;
-    class ExtentManager;
-    class IndexCatalog;
-    class NamespaceDetails;
-    class OperationContext;
+class Collection;
+class DataFile;
+class DatabaseCatalogEntry;
+class ExtentManager;
+class IndexCatalog;
+class NamespaceDetails;
+class OperationContext;
+
+/**
+ * Represents a logical database containing Collections.
+ *
+ * The semantics for a const Database are that you can mutate individual collections but not add or
+ * remove them.
+ */
+class Database {
+public:
+    typedef StringMap<Collection*> CollectionMap;
 
     /**
-     * Database represents a database database
-     * Each database database has its own set of files -- dbname.ns, dbname.0, dbname.1, ...
-     * NOT memory mapped
-    */
-    class Database {
+     * Iterating over a Database yields Collection* pointers.
+     */
+    class iterator {
     public:
-        // you probably need to be in dbHolderMutex when constructing this
-        Database(OperationContext* txn,
-                 const std::string& name,
-                 DatabaseCatalogEntry* dbEntry );
+        using iterator_category = std::forward_iterator_tag;
+        using value_type = Collection*;
+        using pointer = const value_type*;
+        using reference = const value_type&;
+        using difference_type = ptrdiff_t;
 
-        /* you must use this to close - there is essential code in this method that is not in the ~Database destructor.
-           thus the destructor is private.  this could be cleaned up one day...
-        */
-        static void closeDatabase(OperationContext* txn,
-                                  const std::string& db);
+        iterator() = default;
+        iterator(CollectionMap::const_iterator it) : _it(it) {}
 
-        // do not use!
-        ~Database(); // closes files and other cleanup see below.
-
-        const std::string& name() const { return _name; }
-
-        void clearTmpCollections(OperationContext* txn);
-
-        /**
-         * @return true if success.  false if bad level or error creating profile ns
-         */
-        bool setProfilingLevel( OperationContext* txn, int newLevel , std::string& errmsg );
-
-        /**
-         * @return true if ns is part of the database
-         *         ns=foo.bar, db=foo returns true
-         */
-        bool ownsNS( const std::string& ns ) const {
-            if ( ! mongoutils::str::startsWith( ns , _name ) )
-                return false;
-            return ns[_name.size()] == '.';
+        reference operator*() const {
+            return _it->second;
         }
 
-        int getProfilingLevel() const { return _profile; }
-        const char* getProfilingNS() const { return _profileName.c_str(); }
-
-        void getStats( OperationContext* opCtx, BSONObjBuilder* output, double scale = 1 );
-
-        long long getIndexSizeForCollection( OperationContext* opCtx,
-                                             Collection* collections,
-                                             BSONObjBuilder* details = NULL,
-                                             int scale = 1 );
-
-        const DatabaseCatalogEntry* getDatabaseCatalogEntry() const;
-
-        Status dropCollection( OperationContext* txn, const StringData& fullns );
-
-        Collection* createCollection( OperationContext* txn,
-                                      const StringData& ns,
-                                      const CollectionOptions& options = CollectionOptions(),
-                                      bool allocateSpace = true,
-                                      bool createDefaultIndexes = true );
-
-        /**
-         * @param ns - this is fully qualified, which is maybe not ideal ???
-         */
-        Collection* getCollection( OperationContext* txn, const StringData& ns );
-
-        Collection* getCollection( OperationContext* txn, const NamespaceString& ns ) {
-            return getCollection( txn, ns.ns() );
+        pointer operator->() const {
+            return &_it->second;
         }
 
-        Collection* getOrCreateCollection( OperationContext* txn, const StringData& ns );
+        bool operator==(const iterator& other) {
+            return _it == other._it;
+        }
 
-        Status renameCollection( OperationContext* txn,
-                                 const StringData& fromNS,
-                                 const StringData& toNS,
-                                 bool stayTemp );
+        bool operator!=(const iterator& other) {
+            return _it != other._it;
+        }
 
-        /**
-         * @return name of an existing database with same text name but different
-         * casing, if one exists.  Otherwise the empty std::string is returned.  If
-         * 'duplicates' is specified, it is filled with all duplicate names.
-         // TODO move???
-         */
-        static string duplicateUncasedName( const std::string &name,
-                                            std::set< std::string > *duplicates = 0 );
+        iterator& operator++() {
+            ++_it;
+            return *this;
+        }
 
-        static Status validateDBName( const StringData& dbname );
+        iterator operator++(int) {
+            auto oldPosition = *this;
+            ++_it;
+            return oldPosition;
+        }
 
-        const std::string& getSystemIndexesName() const { return _indexesName; }
     private:
-
-        void _clearCollectionCache( const StringData& fullns );
-
-        void _clearCollectionCache_inlock( const StringData& fullns );
-
-        const std::string _name; // "alleyinsider"
-
-        boost::scoped_ptr<DatabaseCatalogEntry> _dbEntry;
-
-        const std::string _profileName; // "alleyinsider.system.profile"
-        const std::string _indexesName; // "alleyinsider.system.indexes"
-
-        int _profile; // 0=off.
-
-        // TODO: make sure deletes go through
-        // this in some ways is a dupe of _namespaceIndex
-        // but it points to a much more useful data structure
-        typedef StringMap< Collection* > CollectionMap;
-        CollectionMap _collections;
-        mongo::mutex _collectionLock;
-
-        friend class Collection;
-        friend class NamespaceDetails;
-        friend class IndexCatalog;
+        CollectionMap::const_iterator _it;
     };
 
-    void dropDatabase(OperationContext* txn, Database* db );
+    Database(OperationContext* txn, StringData name, DatabaseCatalogEntry* dbEntry);
 
-    void dropAllDatabasesExceptLocal(OperationContext* txn);
+    // must call close first
+    ~Database();
 
-    Status userCreateNS( OperationContext* txn,
-                         Database* db,
-                         const StringData& ns,
-                         BSONObj options,
-                         bool logForReplication,
-                         bool createDefaultIndexes = true );
+    iterator begin() const {
+        return iterator(_collections.begin());
+    }
 
-} // namespace mongo
+    iterator end() const {
+        return iterator(_collections.end());
+    }
+
+    // closes files and other cleanup see below.
+    void close(OperationContext* txn);
+
+    const std::string& name() const {
+        return _name;
+    }
+
+    void clearTmpCollections(OperationContext* txn);
+
+    /**
+     * Sets a new profiling level for the database and returns the outcome.
+     *
+     * @param txn Operation context which to use for creating the profiling collection.
+     * @param newLevel New profiling level to use.
+     */
+    Status setProfilingLevel(OperationContext* txn, int newLevel);
+
+    int getProfilingLevel() const {
+        return _profile;
+    }
+    const char* getProfilingNS() const {
+        return _profileName.c_str();
+    }
+
+    void getStats(OperationContext* opCtx, BSONObjBuilder* output, double scale = 1);
+
+    const DatabaseCatalogEntry* getDatabaseCatalogEntry() const;
+
+    Status dropCollection(OperationContext* txn, StringData fullns);
+
+    Collection* createCollection(OperationContext* txn,
+                                 StringData ns,
+                                 const CollectionOptions& options = CollectionOptions(),
+                                 bool createDefaultIndexes = true);
+
+    /**
+     * @param ns - this is fully qualified, which is maybe not ideal ???
+     */
+    Collection* getCollection(StringData ns) const;
+
+    Collection* getCollection(const NamespaceString& ns) const {
+        return getCollection(ns.ns());
+    }
+
+    Collection* getOrCreateCollection(OperationContext* txn, StringData ns);
+
+    Status renameCollection(OperationContext* txn,
+                            StringData fromNS,
+                            StringData toNS,
+                            bool stayTemp);
+
+    /**
+     * Physically drops the specified opened database and removes it from the server's metadata. It
+     * doesn't notify the replication subsystem or do any other consistency checks, so it should
+     * not be used directly from user commands.
+     *
+     * Must be called with the specified database locked in X mode.
+     */
+    static void dropDatabase(OperationContext* txn, Database* db);
+
+    /**
+     * @return name of an existing database with same text name but different
+     * casing, if one exists.  Otherwise the empty std::string is returned.  If
+     * 'duplicates' is specified, it is filled with all duplicate names.
+     // TODO move???
+     */
+    static std::string duplicateUncasedName(const std::string& name,
+                                            std::set<std::string>* duplicates = 0);
+
+    static Status validateDBName(StringData dbname);
+
+    const std::string& getSystemIndexesName() const {
+        return _indexesName;
+    }
+
+private:
+    /**
+     * Gets or creates collection instance from existing metadata,
+     * Returns NULL if invalid
+     *
+     * Note: This does not add the collection to _collections map, that must be done
+     * by the caller, who takes onership of the Collection*
+     */
+    Collection* _getOrCreateCollectionInstance(OperationContext* txn, StringData fullns);
+
+    /**
+     * Deregisters and invalidates all cursors on collection 'fullns'.  Callers must specify
+     * 'reason' for why the cache is being cleared.
+     */
+    void _clearCollectionCache(OperationContext* txn, StringData fullns, const std::string& reason);
+
+    class AddCollectionChange;
+    class RemoveCollectionChange;
+
+    const std::string _name;  // "alleyinsider"
+
+    DatabaseCatalogEntry* _dbEntry;  // not owned here
+
+    const std::string _profileName;  // "alleyinsider.system.profile"
+    const std::string _indexesName;  // "alleyinsider.system.indexes"
+
+    int _profile;  // 0=off.
+
+    CollectionMap _collections;
+
+    friend class Collection;
+    friend class NamespaceDetails;
+    friend class IndexCatalog;
+};
+
+void dropAllDatabasesExceptLocal(OperationContext* txn);
+
+Status userCreateNS(OperationContext* txn,
+                    Database* db,
+                    StringData ns,
+                    BSONObj options,
+                    bool createDefaultIndexes = true);
+
+}  // namespace mongo

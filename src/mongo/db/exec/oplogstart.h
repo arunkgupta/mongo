@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2013-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -28,98 +28,118 @@
 
 #pragma once
 
+
 #include "mongo/base/owned_pointer_vector.h"
-#include "mongo/db/diskloc.h"
 #include "mongo/db/exec/collection_scan.h"
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/record_id.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
 
-    /**
-     * OplogStart walks a collection backwards to find the first object in the collection that
-     * matches the query.  It's used by replication to efficiently find where the oplog should be
-     * replayed from.
-     *
-     * The oplog is always a capped collection.  In capped collections, documents are oriented on
-     * disk according to insertion order.  The oplog inserts documents with increasing timestamps.
-     * Queries on the oplog look for entries that are after a certain time.  Therefore if we
-     * navigate backwards, the last document we encounter that satisfies our query (over the
-     * timestamp) is the first document we must scan from to answer the query.
-     *
-     * Why isn't this a normal reverse table scan, you may ask?  We could be correct if we used a
-     * normal reverse collection scan.  However, that's not fast enough.  Since we know all
-     * documents are oriented on disk in insertion order, we know all documents in one extent were
-     * inserted before documents in a subsequent extent.  As such we can skip through entire extents
-     * looking only at the first document.
-     *
-     * Why is this a stage?  Because we want to yield, and we want to be notified of DiskLoc
-     * invalidations.  :(
-     */
-    class OplogStart : public PlanStage {
-    public:
-        // Does not take ownership.
-        OplogStart(const Collection* collection, MatchExpression* filter, WorkingSet* ws);
-        virtual ~OplogStart();
+class RecordCursor;
 
-        virtual StageState work(WorkingSetID* out);
-        virtual bool isEOF();
+/**
+ * OplogStart walks a collection backwards to find the first object in the collection that
+ * matches the query.  It's used by replication to efficiently find where the oplog should be
+ * replayed from.
+ *
+ * The oplog is always a capped collection.  In capped collections, documents are oriented on
+ * disk according to insertion order.  The oplog inserts documents with increasing timestamps.
+ * Queries on the oplog look for entries that are after a certain time.  Therefore if we
+ * navigate backwards, the last document we encounter that satisfies our query (over the
+ * timestamp) is the first document we must scan from to answer the query.
+ *
+ * Why isn't this a normal reverse table scan, you may ask?  We could be correct if we used a
+ * normal reverse collection scan.  However, that's not fast enough.  Since we know all
+ * documents are oriented on disk in insertion order, we know all documents in one extent were
+ * inserted before documents in a subsequent extent.  As such we can skip through entire extents
+ * looking only at the first document.
+ *
+ * Why is this a stage?  Because we want to yield, and we want to be notified of RecordId
+ * invalidations.  :(
+ */
+class OplogStart final : public PlanStage {
+public:
+    // Does not take ownership.
+    OplogStart(OperationContext* txn,
+               const Collection* collection,
+               MatchExpression* filter,
+               WorkingSet* ws);
 
-        virtual void invalidate(const DiskLoc& dl, InvalidationType type);
-        virtual void prepareToYield();
-        virtual void recoverFromYield();
+    StageState doWork(WorkingSetID* out) final;
+    bool isEOF() final;
 
-        virtual std::vector<PlanStage*> getChildren() const;
+    void doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) final;
+    void doSaveState() final;
+    void doRestoreState() final;
+    void doDetachFromOperationContext() final;
+    void doReattachToOperationContext() final;
 
-        // PS. don't call this.
-        virtual PlanStageStats* getStats() { return NULL; }
+    // Returns empty PlanStageStats object
+    std::unique_ptr<PlanStageStats> getStats() final;
 
-        virtual StageType stageType() const { return STAGE_OPLOG_START; }
+    //
+    // Exec stats -- do not call for the oplog start stage.
+    //
 
-        // For testing only.
-        void setBackwardsScanTime(int newTime) { _backwardsScanTime = newTime; }
-        bool isExtentHopping() { return _extentHopping; }
-        bool isBackwardsScanning() { return _backwardsScanning; }
-    private:
-        StageState workBackwardsScan(WorkingSetID* out);
+    const SpecificStats* getSpecificStats() const final {
+        return NULL;
+    }
 
-        void switchToExtentHopping();
+    StageType stageType() const final {
+        return STAGE_OPLOG_START;
+    }
 
-        StageState workExtentHopping(WorkingSetID* out);
+    // For testing only.
+    void setBackwardsScanTime(int newTime) {
+        _backwardsScanTime = newTime;
+    }
+    bool isExtentHopping() {
+        return _extentHopping;
+    }
+    bool isBackwardsScanning() {
+        return _backwardsScanning;
+    }
 
-        // If we're backwards scanning we just punt to a collscan.
-        scoped_ptr<CollectionScan> _cs;
+    static const char* kStageType;
 
-        // This is only used for the extent hopping scan.
-        typedef OwnedPointerVector<RecordIterator> SubIterators;
-        SubIterators _subIterators;
+private:
+    StageState workBackwardsScan(WorkingSetID* out);
 
-        // Have we done our heavy init yet?
-        bool _needInit;
+    void switchToExtentHopping();
 
-        // Our first state: going backwards via a collscan.
-        bool _backwardsScanning;
+    StageState workExtentHopping(WorkingSetID* out);
 
-        // Our second state: hopping backwards extent by extent.
-        bool _extentHopping;
+    // This is only used for the extent hopping scan.
+    std::vector<std::unique_ptr<RecordCursor>> _subIterators;
 
-        // Our final state: done.
-        bool _done;
+    // Have we done our heavy init yet?
+    bool _needInit;
 
-        const Collection* _collection;
+    // Our first state: going backwards via a collscan.
+    bool _backwardsScanning;
 
-        // We only go backwards via a collscan for a few seconds.
-        Timer _timer;
+    // Our second state: hopping backwards extent by extent.
+    bool _extentHopping;
 
-        // WorkingSet is not owned by us.
-        WorkingSet* _workingSet;
+    // Our final state: done.
+    bool _done;
 
-        std::string _ns;
+    const Collection* _collection;
 
-        MatchExpression* _filter;
+    // We only go backwards via a collscan for a few seconds.
+    Timer _timer;
 
-        static int _backwardsScanTime;
-    };
+    // WorkingSet is not owned by us.
+    WorkingSet* _workingSet;
+
+    std::string _ns;
+
+    MatchExpression* _filter;
+
+    static int _backwardsScanTime;
+};
 
 }  // namespace mongo

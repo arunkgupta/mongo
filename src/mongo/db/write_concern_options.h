@@ -29,39 +29,84 @@
 
 #include <string>
 
-#include "mongo/base/status.h"
 #include "mongo/db/jsobj.h"
 
 namespace mongo {
 
-    struct WriteConcernOptions {
-    public:
+class Status;
 
-        static const int kNoTimeout = 0;
-        static const int kNoWaiting = -1;
-        static const BSONObj Default;
-        static const BSONObj Acknowledged;
-        static const BSONObj AllConfigs;
-        static const BSONObj Unacknowledged;
+struct WriteConcernOptions {
+public:
+    enum class SyncMode { UNSET, NONE, FSYNC, JOURNAL };
 
-        WriteConcernOptions() { reset(); }
+    static const int kNoTimeout;
+    static const int kNoWaiting;
 
-        Status parse( const BSONObj& obj );
+    static const BSONObj Default;
+    static const BSONObj Acknowledged;
+    static const BSONObj Unacknowledged;
+    static const BSONObj Majority;
 
-        void reset() {
-            syncMode = NONE;
-            wNumNodes = 0;
-            wMode = "";
-            wTimeout = 0;
-        }
+    static const char kMajority[];  // = "majority"
 
-        enum SyncMode { NONE, FSYNC, JOURNAL } syncMode;
+    WriteConcernOptions() {
+        reset();
+    }
 
-        int wNumNodes;
-        std::string wMode;
+    WriteConcernOptions(int numNodes, SyncMode sync, int timeout);
 
-        int wTimeout;
-    };
+    WriteConcernOptions(int numNodes, SyncMode sync, Milliseconds timeout);
 
-}
+    WriteConcernOptions(const std::string& mode, SyncMode sync, int timeout);
 
+    WriteConcernOptions(const std::string& mode, SyncMode sync, Milliseconds timeout);
+
+    Status parse(const BSONObj& obj);
+
+    /**
+     * Attempts to extract a writeConcern from cmdObj.
+     * Verifies that the writeConcern is of type Object (BSON type).
+     */
+    static StatusWith<WriteConcernOptions> extractWCFromCommand(
+        const BSONObj& cmdObj,
+        const std::string& dbName,
+        const WriteConcernOptions& defaultWC = WriteConcernOptions());
+
+    /**
+     * Return true if the server needs to wait for other secondary nodes to satisfy this
+     * write concern setting. Errs on the false positive for non-empty wMode.
+     */
+    bool shouldWaitForOtherNodes() const;
+
+    /**
+     * Returns true if this is a valid write concern to use against a config server.
+     * TODO(spencer): Once we stop supporting SCCC config servers, forbid this from allowing w:1
+     */
+    bool validForConfigServers() const;
+
+    void reset() {
+        syncMode = SyncMode::UNSET;
+        wNumNodes = 0;
+        wMode = "";
+        wTimeout = 0;
+    }
+
+    // Returns the BSON representation of this object.
+    // Warning: does not return the same object passed on the last parse() call.
+    BSONObj toBSON() const;
+
+    SyncMode syncMode;
+
+    // The w parameter for this write concern. The wMode represents the string format and
+    // takes precedence over the numeric format wNumNodes.
+    int wNumNodes;
+    std::string wMode;
+
+    // Timeout in milliseconds.
+    int wTimeout;
+
+    // True if the default write concern was used.
+    bool usedDefault = false;
+};
+
+}  // namespace mongo

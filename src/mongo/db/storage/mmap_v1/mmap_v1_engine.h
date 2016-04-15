@@ -30,28 +30,91 @@
 
 #pragma once
 
+#include <map>
+
+#include "mongo/db/storage/mmap_v1/record_access_tracker.h"
+#include "mongo/db/storage/mmap_v1/extent_manager.h"
 #include "mongo/db/storage/storage_engine.h"
+#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 
-    class MMAPV1Engine : public StorageEngine {
-    public:
-        virtual ~MMAPV1Engine();
+class JournalListener;
+class MMAPV1DatabaseCatalogEntry;
 
-        RecoveryUnit* newRecoveryUnit( OperationContext* opCtx );
-        void listDatabases( std::vector<std::string>* out ) const;
-        int flushAllFiles( bool sync );
+class MMAPV1Engine : public StorageEngine {
+public:
+    MMAPV1Engine(const StorageEngineLockFile* lockFile);
+    MMAPV1Engine(const StorageEngineLockFile* lockFile,
+                 std::unique_ptr<ExtentManager::Factory> extentManagerFactory);
+    virtual ~MMAPV1Engine();
 
-        Status repairDatabase( OperationContext* tnx,
-                               const std::string& dbName,
-                               bool preserveClonedFilesOnFailure,
-                               bool backupOriginalFiles );
+    void finishInit();
 
-        DatabaseCatalogEntry* getDatabaseCatalogEntry( OperationContext* opCtx,
-                                                       const StringData& db );
+    RecoveryUnit* newRecoveryUnit();
+    void listDatabases(std::vector<std::string>* out) const;
 
-    private:
-        static void _listDatabases( const std::string& directory,
-                                    std::vector<std::string>* out );
-    };
+    int flushAllFiles(bool sync);
+    Status beginBackup(OperationContext* txn);
+    void endBackup(OperationContext* txn);
+
+    DatabaseCatalogEntry* getDatabaseCatalogEntry(OperationContext* opCtx, StringData db);
+
+    virtual bool supportsDocLocking() const {
+        return false;
+    }
+    virtual bool isMmapV1() const {
+        return true;
+    }
+
+    virtual bool isDurable() const;
+
+    virtual bool isEphemeral() const;
+
+    virtual Status closeDatabase(OperationContext* txn, StringData db);
+
+    virtual Status dropDatabase(OperationContext* txn, StringData db);
+
+    virtual void cleanShutdown();
+
+    // Callers should use  repairDatabase instead.
+    virtual Status repairRecordStore(OperationContext* txn, const std::string& ns) {
+        return Status(ErrorCodes::InternalError, "MMAPv1 doesn't support repairRecordStore");
+    }
+
+    // MMAPv1 specific (non-virtual)
+    Status repairDatabase(OperationContext* txn,
+                          const std::string& dbName,
+                          bool preserveClonedFilesOnFailure,
+                          bool backupOriginalFiles);
+
+    /**
+     * Gets a reference to the abstraction used by MMAP v1 to track recently used memory
+     * addresses.
+     *
+     * MMAPv1 specific (non-virtual). This is non-const because callers are allowed to use
+     * the returned reference to modify the RecordAccessTracker.
+     *
+     * The RecordAccessTracker is thread-safe (it uses its own mutex internally).
+     */
+    RecordAccessTracker& getRecordAccessTracker();
+
+    void setJournalListener(JournalListener* jl) final;
+
+private:
+    static void _listDatabases(const std::string& directory, std::vector<std::string>* out);
+
+    stdx::mutex _entryMapMutex;
+    typedef std::map<std::string, MMAPV1DatabaseCatalogEntry*> EntryMap;
+    EntryMap _entryMap;
+
+    // A record access tracker is essentially a large table which tracks recently used
+    // addresses. It is used when higher layers (e.g. the query system) need to ask
+    // the storage engine whether data is likely in physical memory.
+    RecordAccessTracker _recordAccessTracker;
+
+    std::unique_ptr<ExtentManager::Factory> _extentManagerFactory;
+};
+
+void _deleteDataFiles(const std::string& database);
 }

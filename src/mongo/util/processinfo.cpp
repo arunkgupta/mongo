@@ -27,7 +27,9 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+
+#include "mongo/platform/basic.h"
 
 #include "mongo/base/init.h"
 #include "mongo/util/processinfo.h"
@@ -35,51 +37,56 @@
 #include <iostream>
 #include <fstream>
 
+#include "mongo/util/log.h"
+
 using namespace std;
 
 namespace mongo {
 
-    class PidFileWiper {
-    public:
-        ~PidFileWiper() {
-            if (path.empty()) {
-                return;
+class PidFileWiper {
+public:
+    ~PidFileWiper() {
+        if (path.empty()) {
+            return;
+        }
+
+        ofstream out(path.c_str(), ios_base::out);
+        out.close();
+    }
+
+    bool write(const string& p) {
+        path = p;
+        ofstream out(path.c_str(), ios_base::out);
+        out << ProcessId::getCurrent() << endl;
+        if (!out.good()) {
+            auto errAndStr = errnoAndDescription();
+            if (errAndStr.first == 0) {
+                log() << "ERROR: Cannot write pid file to " << path
+                      << ": Unable to determine OS error";
+            } else {
+                log() << "ERROR: Cannot write pid file to " << path << ": " << errAndStr.second;
             }
-
-            ofstream out( path.c_str() , ios_base::out );
-            out.close();
         }
-
-        bool write( const string& p ) {
-            path = p;
-            ofstream out( path.c_str() , ios_base::out );
-            out << ProcessId::getCurrent() << endl;
-            return out.good();
-        }
-
-        string path;
-    } pidFileWiper;
-
-    bool writePidFile( const string& path ) {
-        bool e = pidFileWiper.write( path );
-        if (!e) {
-            log() << "ERROR: Cannot write pid file to " << path
-                  << ": "<< strerror(errno);
-        }
-        return e;
+        return out.good();
     }
 
-    ProcessInfo::SystemInfo* ProcessInfo::systemInfo = NULL;
+    string path;
+} pidFileWiper;
 
-    void ProcessInfo::initializeSystemInfo() {
-        if (systemInfo == NULL) {
-            systemInfo = new SystemInfo();
-        }
+bool writePidFile(const string& path) {
+    return pidFileWiper.write(path);
+}
+
+ProcessInfo::SystemInfo* ProcessInfo::systemInfo = NULL;
+
+void ProcessInfo::initializeSystemInfo() {
+    if (systemInfo == NULL) {
+        systemInfo = new SystemInfo();
     }
+}
 
-    MONGO_INITIALIZER(SystemInfo)(InitializerContext* context) {
-        ProcessInfo::initializeSystemInfo();
-        return Status::OK();
-    }
-
+MONGO_INITIALIZER(SystemInfo)(InitializerContext* context) {
+    ProcessInfo::initializeSystemInfo();
+    return Status::OK();
+}
 }

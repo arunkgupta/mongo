@@ -26,112 +26,125 @@
 *    it in the license file.
 */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
-#include "mongo/base/init.h"
 #include "mongo/base/status.h"
-#include "mongo/bson/util/builder.h"
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/cloner.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/copydb.h"
-#include "mongo/db/commands/rename_collection.h"
-#include "mongo/db/db.h"
-#include "mongo/db/dbhelpers.h"
-#include "mongo/db/index_builder.h"
-#include "mongo/db/instance.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/namespace_string.h"
-#include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/oplogreader.h"
-#include "mongo/db/operation_context_impl.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/s/grid.h"
 
-namespace mongo {
+namespace {
 
-    /* Usage:
-       mydb.$cmd.findOne( { clone: "fromhost" } );
-       Note: doesn't work with authentication enabled, except as internal operation or for
-       old-style users for backwards compatibility.
-    */
-    class CmdClone : public Command {
-    public:
-        CmdClone() : Command("clone") { }
+using namespace mongo;
 
-        virtual bool slaveOk() const {
+using std::set;
+using std::string;
+using std::stringstream;
+
+/* Usage:
+   mydb.$cmd.findOne( { clone: "fromhost" } );
+   Note: doesn't work with authentication enabled, except as internal operation or for
+   old-style users for backwards compatibility.
+*/
+class CmdClone : public Command {
+public:
+    CmdClone() : Command("clone") {}
+
+    virtual bool slaveOk() const {
+        return false;
+    }
+
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
+
+    virtual void help(stringstream& help) const {
+        help << "clone this database from an instance of the db on another host\n";
+        help << "{clone: \"host13\"[, slaveOk: <bool>]}";
+    }
+
+    virtual Status checkAuthForCommand(ClientBasic* client,
+                                       const std::string& dbname,
+                                       const BSONObj& cmdObj) {
+        ActionSet actions;
+        actions.addAction(ActionType::insert);
+        actions.addAction(ActionType::createIndex);
+        if (shouldBypassDocumentValidationForCommand(cmdObj)) {
+            actions.addAction(ActionType::bypassDocumentValidation);
+        }
+
+        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
+                ResourcePattern::forDatabaseName(dbname), actions)) {
+            return Status(ErrorCodes::Unauthorized, "Unauthorized");
+        }
+        return Status::OK();
+    }
+
+    virtual bool run(OperationContext* txn,
+                     const string& dbname,
+                     BSONObj& cmdObj,
+                     int,
+                     string& errmsg,
+                     BSONObjBuilder& result) {
+        boost::optional<DisableDocumentValidation> maybeDisableValidation;
+        if (shouldBypassDocumentValidationForCommand(cmdObj)) {
+            maybeDisableValidation.emplace(txn);
+        }
+
+        string from = cmdObj.getStringField("clone");
+        if (from.empty())
             return false;
-        }
 
-        virtual bool isWriteCommandForConfigServer() const { return true; }
+        CloneOptions opts;
+        opts.fromDB = dbname;
+        opts.slaveOk = cmdObj["slaveOk"].trueValue();
+        opts.checkForCatalogChange = cmdObj["_checkForCatalogChange"].trueValue();
 
-        virtual void help( stringstream &help ) const {
-            help << "clone this database from an instance of the db on another host\n";
-            help << "{ clone : \"host13\" }";
-        }
-
-        virtual Status checkAuthForCommand(ClientBasic* client,
-                                           const std::string& dbname,
-                                           const BSONObj& cmdObj) {
-            ActionSet actions;
-            actions.addAction(ActionType::insert);
-            actions.addAction(ActionType::createIndex);
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
-                    ResourcePattern::forDatabaseName(dbname), actions)) {
-                return Status(ErrorCodes::Unauthorized, "Unauthorized");
+        if (opts.checkForCatalogChange) {
+            auto catalogManager = grid.catalogManager(txn);
+            if (!catalogManager) {
+                return appendCommandStatus(
+                    result,
+                    Status(ErrorCodes::NotYetInitialized,
+                           "Cannot run clone command for use by sharding movePrimary command on a "
+                           "node that isn't yet sharding aware"));
             }
-            return Status::OK();
         }
 
-        virtual bool run(OperationContext* txn,
-                         const string& dbname,
-                         BSONObj& cmdObj,
-                         int,
-                         string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
+        // See if there's any collections we should ignore
+        if (cmdObj["collsToIgnore"].type() == Array) {
+            BSONObjIterator it(cmdObj["collsToIgnore"].Obj());
 
-            string from = cmdObj.getStringField("clone");
-            if ( from.empty() )
-                return false;
-
-            CloneOptions opts;
-            opts.fromDB = dbname;
-            opts.logForRepl = ! fromRepl;
-
-            // See if there's any collections we should ignore
-            if( cmdObj["collsToIgnore"].type() == Array ){
-                BSONObjIterator it( cmdObj["collsToIgnore"].Obj() );
-
-                while( it.more() ){
-                    BSONElement e = it.next();
-                    if( e.type() == String ){
-                        opts.collsToIgnore.insert( e.String() );
-                    }
+            while (it.more()) {
+                BSONElement e = it.next();
+                if (e.type() == String) {
+                    opts.collsToIgnore.insert(e.String());
                 }
             }
-
-            set<string> clonedColls;
-
-            Lock::DBWrite dbXLock(txn->lockState(), dbname);
-            //  SERVER-14085: This unit of work should go away and be put in the individual ops
-            WriteUnitOfWork wunit(txn->recoveryUnit());
-
-            Cloner cloner;
-            bool rval = cloner.go(txn, dbname, from, opts, &clonedColls, errmsg);
-
-            BSONArrayBuilder barr;
-            barr.append( clonedColls );
-
-            result.append( "clonedColls", barr.arr() );
-            wunit.commit();
-
-            return rval;
-
         }
-    } cmdClone;
 
-} // namespace mongo
+        set<string> clonedColls;
+
+        ScopedTransaction transaction(txn, MODE_IX);
+        Lock::DBLock dbXLock(txn->lockState(), dbname, MODE_X);
+
+        Cloner cloner;
+        Status status = cloner.copyDb(txn, dbname, from, opts, &clonedColls);
+
+        BSONArrayBuilder barr;
+        barr.append(clonedColls);
+
+        result.append("clonedColls", barr.arr());
+
+        return appendCommandStatus(result, status);
+    }
+
+} cmdClone;
+
+}  // namespace

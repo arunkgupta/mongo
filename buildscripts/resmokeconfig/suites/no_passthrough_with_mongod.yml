@@ -1,0 +1,23 @@
+selector:
+  js_test:
+    roots:
+    - jstests/noPassthroughWithMongod/*.js
+    exclude_files:
+    # SERVER-22970
+    - jstests/noPassthroughWithMongod/index_multi.js
+    - jstests/noPassthroughWithMongod/indexbg_updates.js
+
+executor:
+  js_test:
+    config:
+      shell_options:
+        readMode: commands
+    hooks:
+    - class: ValidateCollections
+    - class: CleanEveryN
+      n: 20
+    fixture:
+      class: MongoDFixture
+      mongod_options:
+        set_parameters:
+          enableTestCommands: 1

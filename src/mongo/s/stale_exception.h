@@ -35,152 +35,99 @@
 
 namespace mongo {
 
-    using mongoutils::str::stream;
+/**
+ * Thrown whenever the config info for a given shard/chunk is out of date.
+ */
+class StaleConfigException : public AssertionException {
+public:
+    StaleConfigException(const std::string& ns,
+                         const std::string& raw,
+                         int code,
+                         ChunkVersion received,
+                         ChunkVersion wanted)
+        : AssertionException(
+              str::stream() << raw << " ( ns : " << ns << ", received : " << received.toString()
+                            << ", wanted : " << wanted.toString() << ", "
+                            << (code == ErrorCodes::SendStaleConfig ? "send" : "recv") << " )",
+              code),
+          _ns(ns),
+          _received(received),
+          _wanted(wanted) {}
+
+    /** Preferred if we're rebuilding this from a thrown exception */
+    StaleConfigException(const std::string& raw, int code, const BSONObj& error)
+        : AssertionException(str::stream()
+                                 << raw << " ( ns : " << (error["ns"].type() == String
+                                                              ? error["ns"].String()
+                                                              : std::string("<unknown>"))
+                                 << ", received : "
+                                 << ChunkVersion::fromBSON(error, "vReceived").toString()
+                                 << ", wanted : "
+                                 << ChunkVersion::fromBSON(error, "vWanted").toString() << ", "
+                                 << (code == ErrorCodes::SendStaleConfig ? "send" : "recv") << " )",
+                             code),
+          // For legacy reasons, we may not always get a namespace here
+          _ns(error["ns"].type() == String ? error["ns"].String() : ""),
+          _received(ChunkVersion::fromBSON(error, "vReceived")),
+          _wanted(ChunkVersion::fromBSON(error, "vWanted")) {}
 
     /**
-     * Thrown whenever your config info for a given shard/chunk is out of date.
+     * TODO: This constructor is only necessary, because ParallelSortClusteredCursor puts per-host
+     * stale config exceptions in a map and this requires a default constructor.
      */
-    class StaleConfigException : public AssertionException {
-    public:
-        StaleConfigException( const std::string& ns,
-                              const std::string& raw,
-                              int code,
-                              ChunkVersion received,
-                              ChunkVersion wanted,
-                              bool justConnection = false )
-            : AssertionException(stream() << raw << " ( ns : " << ns
-                                          << ", received : " << received.toString()
-                                          << ", wanted : " << wanted.toString()
-                                          << ", " << ( code == SendStaleConfigCode ?
-                                                       "send" : "recv" ) << " )",
-                                 code ),
-              _justConnection(justConnection),
-              _ns(ns),
-              _received( received ),
-              _wanted( wanted ) {
-        }
+    StaleConfigException()
+        : AssertionException("initializing empty stale config exception object", 0) {}
 
-        /** Preferred if we're rebuilding this from a thrown exception */
-        StaleConfigException( const std::string& raw,
-                              int code,
-                              const BSONObj& error,
-                              bool justConnection = false )
-            : AssertionException( stream() << raw << " ( ns : "
-                                           << ( error["ns"].type() == String ?
-                                                error["ns"].String() : std::string("<unknown>") )
-                                           << ", received : "
-                                           << ChunkVersion::fromBSON( error, "vReceived" ).toString()
-                                           << ", wanted : "
-                                           << ChunkVersion::fromBSON( error, "vWanted" ).toString()
-                                           << ", "
-                                           << ( code == SendStaleConfigCode ?
-                                                "send" : "recv" ) << " )",
-                                  code ),
-              _justConnection(justConnection) ,
-              // For legacy reasons, we may not always get a namespace here
-              _ns( error["ns"].type() == String ? error["ns"].String() : "" ),
-              _received( ChunkVersion::fromBSON( error, "vReceived" ) ),
-              _wanted( ChunkVersion::fromBSON( error, "vWanted" ) ) {
-        }
+    virtual ~StaleConfigException() throw() {}
 
-        /**
-         * Needs message so when we trace all exceptions on construction we get a useful
-         * message
-         */
-        StaleConfigException() :
-            AssertionException( "initializing empty stale config exception object", 0 ) {
-        }
+    virtual void appendPrefix(std::stringstream& ss) const {
+        ss << "stale sharding config exception: ";
+    }
 
-        virtual ~StaleConfigException() throw() {}
+    std::string getns() const {
+        return _ns;
+    }
 
-        virtual void appendPrefix( std::stringstream& ss ) const {
-            ss << "stale sharding config exception: ";
-        }
+    ChunkVersion getVersionReceived() const {
+        return _received;
+    }
 
-        bool justConnection() const { return _justConnection; }
+    ChunkVersion getVersionWanted() const {
+        return _wanted;
+    }
 
-        std::string getns() const { return _ns; }
+    /**
+     * Returns true if this exception would require a full reload of config data to resolve.
+     */
+    bool requiresFullReload() const {
+        return !_received.hasEqualEpoch(_wanted) || _received.isSet() != _wanted.isSet();
+    }
 
-        /**
-         * true if this exception would require a full reload of config data to resolve
-         */
-        bool requiresFullReload() const {
-            return ! _received.hasEqualEpoch( _wanted ) ||
-                     _received.isSet() != _wanted.isSet();
-        }
+private:
+    std::string _ns;
+    ChunkVersion _received;
+    ChunkVersion _wanted;
+};
 
-        static bool parse( const std::string& big , std::string& ns , std::string& raw ) {
-            std::string::size_type start = big.find( '[' );
-            if ( start == std::string::npos )
-                return false;
-            std::string::size_type end = big.find( ']' ,start );
-            if ( end == std::string::npos )
-                return false;
+class SendStaleConfigException : public StaleConfigException {
+public:
+    SendStaleConfigException(const std::string& ns,
+                             const std::string& raw,
+                             ChunkVersion received,
+                             ChunkVersion wanted)
+        : StaleConfigException(ns, raw, ErrorCodes::SendStaleConfig, received, wanted) {}
+};
 
-            ns = big.substr( start + 1 , ( end - start ) - 1 );
-            raw = big.substr( end + 1 );
-            return true;
-        }
+class RecvStaleConfigException : public StaleConfigException {
+public:
+    RecvStaleConfigException(const std::string& ns,
+                             const std::string& raw,
+                             ChunkVersion received,
+                             ChunkVersion wanted)
+        : StaleConfigException(ns, raw, ErrorCodes::RecvStaleConfig, received, wanted) {}
 
-        ChunkVersion getVersionReceived() const {
-            return _received;
-        }
+    RecvStaleConfigException(const std::string& raw, const BSONObj& error)
+        : StaleConfigException(raw, ErrorCodes::RecvStaleConfig, error) {}
+};
 
-        ChunkVersion getVersionWanted() const {
-            return _wanted;
-        }
-
-        StaleConfigException& operator=( const StaleConfigException& elem ) {
-
-            this->_ei.msg = elem._ei.msg;
-            this->_ei.code = elem._ei.code;
-            this->_justConnection = elem._justConnection;
-            this->_ns = elem._ns;
-            this->_received = elem._received;
-            this->_wanted = elem._wanted;
-
-            return *this;
-        }
-
-    private:
-        bool _justConnection;
-        std::string _ns;
-        ChunkVersion _received;
-        ChunkVersion _wanted;
-    };
-
-    class SendStaleConfigException : public StaleConfigException {
-    public:
-        SendStaleConfigException( const std::string& ns,
-                                  const std::string& raw,
-                                  ChunkVersion received,
-                                  ChunkVersion wanted,
-                                  bool justConnection = false )
-            : StaleConfigException( ns, raw, SendStaleConfigCode, received, wanted, justConnection ){
-        }
-
-        SendStaleConfigException( const std::string& raw,
-                                  const BSONObj& error,
-                                  bool justConnection = false )
-            : StaleConfigException( raw, SendStaleConfigCode, error, justConnection ) {
-        }
-    };
-
-    class RecvStaleConfigException : public StaleConfigException {
-    public:
-        RecvStaleConfigException( const std::string& ns,
-                                  const std::string& raw,
-                                  ChunkVersion received,
-                                  ChunkVersion wanted,
-                                  bool justConnection = false )
-            : StaleConfigException( ns, raw, RecvStaleConfigCode, received, wanted, justConnection ){
-        }
-
-        RecvStaleConfigException( const std::string& raw,
-                                  const BSONObj& error,
-                                  bool justConnection = false )
-            : StaleConfigException( raw, RecvStaleConfigCode, error, justConnection ) {
-        }
-    };
-
-} // namespace mongo
+}  // namespace mongo

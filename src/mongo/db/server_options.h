@@ -29,120 +29,113 @@
 
 #include "mongo/db/jsobj.h"
 #include "mongo/platform/process_id.h"
-#include "mongo/util/net/listen.h" // For DEFAULT_MAX_CONN
+#include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/util/net/listen.h"  // For DEFAULT_MAX_CONN
 
 namespace mongo {
 
-    const int DEFAULT_UNIX_PERMS = 0700;
+const int DEFAULT_UNIX_PERMS = 0700;
 
-    struct ServerGlobalParams {
+enum class ClusterRole { None, ShardServer, ConfigServer };
 
-        ServerGlobalParams() :
-            port(DefaultDBPort), rest(false), jsonp(false), indexBuildRetry(true), quiet(false),
-            configsvr(false), cpu(false), objcheck(true), defaultProfile(0),
-            slowMS(100), defaultLocalThresholdMillis(15), moveParanoia(true),
-            noUnixSocket(false), doFork(0), socket("/tmp"), maxConns(DEFAULT_MAX_CONN), 
-            unixSocketPermissions(DEFAULT_UNIX_PERMS), logAppend(false), logRenameOnRotate(true),
-            logWithSyslog(false), isHttpInterfaceEnabled(false)
-        {
-            started = time(0);
-        }
+struct ServerGlobalParams {
+    std::string binaryName;  // mongod or mongos
+    std::string cwd;         // cwd of when process started
 
-        std::string binaryName;     // mongod or mongos
-        std::string cwd;            // cwd of when process started
+    int port = DefaultDBPort;  // --port
+    enum { DefaultDBPort = 27017, ConfigServerPort = 27019, ShardServerPort = 27018 };
+    bool isDefaultPort() const {
+        return port == DefaultDBPort;
+    }
 
-        int port;              // --port
-        enum {
-            DefaultDBPort = 27017,
-            ConfigServerPort = 27019,
-            ShardServerPort = 27018
-        };
-        bool isDefaultPort() const { return port == DefaultDBPort; }
+    std::string bind_ip;  // --bind_ip
+    bool rest = false;    // --rest
+    bool jsonp = false;   // --jsonp
 
-        std::string bind_ip;        // --bind_ip
-        bool rest;             // --rest
-        bool jsonp;            // --jsonp
+    bool indexBuildRetry = true;  // --noIndexBuildRetry
 
-        bool indexBuildRetry;  // --noIndexBuildRetry
+    std::atomic<bool> quiet{false};  // --quiet NOLINT
 
-        bool quiet;            // --quiet
+    ClusterRole clusterRole = ClusterRole::None;  // --configsvr/--shardsvr
+    CatalogManager::ConfigServerMode configsvrMode =
+        CatalogManager::ConfigServerMode::NONE;  // -- configsvrMode
 
-        bool configsvr;        // --configsvr
+    bool cpu = false;  // --cpu show cpu time periodically
 
-        bool cpu;              // --cpu show cpu time periodically
+    bool objcheck = true;  // --objcheck
 
-        bool objcheck;         // --objcheck
+    int defaultProfile = 0;                // --profile
+    int slowMS = 100;                      // --time in ms that is "slow"
+    int defaultLocalThresholdMillis = 15;  // --localThreshold in ms to consider a node local
+    bool moveParanoia = false;             // for move chunk paranoia
 
-        int defaultProfile;    // --profile
-        int slowMS;            // --time in ms that is "slow"
-        int defaultLocalThresholdMillis;    // --localThreshold in ms to consider a node local
-        bool moveParanoia;     // for move chunk paranoia
+    bool noUnixSocket = false;    // --nounixsocket
+    bool doFork = false;          // --fork
+    std::string socket = "/tmp";  // UNIX domain socket directory
 
-        bool noUnixSocket;     // --nounixsocket
-        bool doFork;           // --fork
-        std::string socket;    // UNIX domain socket directory
+    int maxConns = DEFAULT_MAX_CONN;  // Maximum number of simultaneous open connections.
 
-        int maxConns;          // Maximum number of simultaneous open connections.
+    int unixSocketPermissions = DEFAULT_UNIX_PERMS;  // permissions for the UNIX domain socket
 
-        int unixSocketPermissions; // permissions for the UNIX domain socket
+    std::string keyFile;  // Path to keyfile, or empty if none.
+    std::string pidFile;  // Path to pid file, or empty if none.
 
-        std::string keyFile;   // Path to keyfile, or empty if none.
-        std::string pidFile;   // Path to pid file, or empty if none.
+    std::string logpath;            // Path to log file, if logging to a file; otherwise, empty.
+    bool logAppend = false;         // True if logging to a file in append mode.
+    bool logRenameOnRotate = true;  // True if logging should rename log files on rotate
+    bool logWithSyslog = false;     // True if logging to syslog; must not be set if logpath is set.
+    int syslogFacility;             // Facility used when appending messages to the syslog.
 
-        std::string logpath;   // Path to log file, if logging to a file; otherwise, empty.
-        bool logAppend;        // True if logging to a file in append mode.
-        bool logRenameOnRotate;// True if logging should rename log files on rotate
-        bool logWithSyslog;    // True if logging to syslog; must not be set if logpath is set.
-        int syslogFacility;    // Facility used when appending messages to the syslog.
-
-        bool isHttpInterfaceEnabled; // True if the dbwebserver should be enabled.
+    bool isHttpInterfaceEnabled = false;  // True if the dbwebserver should be enabled.
 
 #ifndef _WIN32
-        ProcessId parentProc;      // --fork pid of initial process
-        ProcessId leaderProc;      // --fork pid of leader process
+    ProcessId parentProc;  // --fork pid of initial process
+    ProcessId leaderProc;  // --fork pid of leader process
 #endif
 
+    /**
+     * Switches to enable experimental (unsupported) features.
+     */
+    struct ExperimentalFeatures {
+        ExperimentalFeatures() : storageDetailsCmdEnabled(false) {}
+        bool storageDetailsCmdEnabled;  // -- enableExperimentalStorageDetailsCmd
+    } experimental;
+
+    time_t started = ::time(0);
+
+    BSONArray argvArray;
+    BSONObj parsedOpts;
+
+    enum AuthState { kEnabled, kDisabled, kUndefined };
+
+    AuthState authState = AuthState::kUndefined;
+
+    bool tryClusterAuth = false;  // --tryClusterAuth, mixed mode for rolling auth upgrade
+    AtomicInt32 clusterAuthMode;  // --clusterAuthMode, the internal cluster auth mode
+
+    enum ClusterAuthModes {
+        ClusterAuthMode_undefined,
         /**
-         * Switches to enable experimental (unsupported) features.
-         */
-        struct ExperimentalFeatures {
-            ExperimentalFeatures()
-                : indexStatsCmdEnabled(false)
-                , storageDetailsCmdEnabled(false)
-            {}
-            bool indexStatsCmdEnabled; // -- enableExperimentalIndexStatsCmd
-            bool storageDetailsCmdEnabled; // -- enableExperimentalStorageDetailsCmd
-        } experimental;
+        * Authenticate using keyfile, accept only keyfiles
+        */
+        ClusterAuthMode_keyFile,
 
-        time_t started;
+        /**
+        * Authenticate using keyfile, accept both keyfiles and X.509
+        */
+        ClusterAuthMode_sendKeyFile,
 
-        BSONArray argvArray;
-        BSONObj parsedOpts;
-        AtomicInt32 clusterAuthMode;    // --clusterAuthMode, the internal cluster auth mode
+        /**
+        * Authenticate using X.509, accept both keyfiles and X.509
+        */
+        ClusterAuthMode_sendX509,
 
-        enum ClusterAuthModes {
-            ClusterAuthMode_undefined,
-            /** 
-            * Authenticate using keyfile, accept only keyfiles
-            */
-            ClusterAuthMode_keyFile,
-
-            /**
-            * Authenticate using keyfile, accept both keyfiles and X.509
-            */
-            ClusterAuthMode_sendKeyFile,
-
-            /**
-            * Authenticate using X.509, accept both keyfiles and X.509
-            */
-            ClusterAuthMode_sendX509,
-
-            /**
-            * Authenticate using X.509, accept only X.509
-            */
-            ClusterAuthMode_x509
-        };
+        /**
+        * Authenticate using X.509, accept only X.509
+        */
+        ClusterAuthMode_x509
     };
+};
 
-    extern ServerGlobalParams serverGlobalParams;
+extern ServerGlobalParams serverGlobalParams;
 }

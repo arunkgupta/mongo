@@ -28,91 +28,111 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/commands.h"
-#include "mongo/db/query/internal_plans.h"
-#include "mongo/db/query/runner.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/operation_context_impl.h"
+#include "mongo/db/query/internal_plans.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
-    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kCommands);
+using std::endl;
+using std::string;
+using std::stringstream;
 
-    class ValidateCmd : public Command {
-    public:
-        ValidateCmd() : Command( "validate" ) {}
+MONGO_FP_DECLARE(validateCmdCollectionNotValid);
 
-        virtual bool slaveOk() const {
+class ValidateCmd : public Command {
+public:
+    ValidateCmd() : Command("validate") {}
+
+    virtual bool slaveOk() const {
+        return true;
+    }
+
+    virtual void help(stringstream& h) const {
+        h << "Validate contents of a namespace by scanning its data structures for correctness.  "
+             "Slow.\n"
+             "Add full:true option to do a more thorough check";
+    }
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
+    virtual void addRequiredPrivileges(const std::string& dbname,
+                                       const BSONObj& cmdObj,
+                                       std::vector<Privilege>* out) {
+        ActionSet actions;
+        actions.addAction(ActionType::validate);
+        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+    }
+    //{ validate: "collectionnamewithoutthedbpart" [, scandata: <bool>] [, full: <bool> } */
+
+    bool run(OperationContext* txn,
+             const string& dbname,
+             BSONObj& cmdObj,
+             int,
+             string& errmsg,
+             BSONObjBuilder& result) {
+        if (MONGO_FAIL_POINT(validateCmdCollectionNotValid)) {
+            errmsg = "validateCmdCollectionNotValid fail point was triggered";
+            result.appendBool("valid", false);
             return true;
         }
 
-        virtual void help(stringstream& h) const { h << "Validate contents of a namespace by scanning its data structures for correctness.  Slow.\n"
-                                                        "Add full:true option to do a more thorough check"; }
+        string ns = dbname + "." + cmdObj.firstElement().valuestrsafe();
 
-        virtual bool isWriteCommandForConfigServer() const { return false; }
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
-            ActionSet actions;
-            actions.addAction(ActionType::validate);
-            out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
-        }
-        //{ validate: "collectionnamewithoutthedbpart" [, scandata: <bool>] [, full: <bool> } */
+        NamespaceString ns_string(ns);
+        const bool full = cmdObj["full"].trueValue();
+        const bool scanData = full || cmdObj["scandata"].trueValue();
 
-        bool run(OperationContext* txn, const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
-            string ns = dbname + "." + cmdObj.firstElement().valuestrsafe();
-
-            NamespaceString ns_string(ns);
-            const bool full = cmdObj["full"].trueValue();
-            const bool scanData = full || cmdObj["scandata"].trueValue();
-
-            if ( !ns_string.isNormal() && full ) {
-                errmsg = "Can only run full validate on a regular collection";
-                return false;
-            }
-
-            if (!serverGlobalParams.quiet) {
-                LOG(0) << "CMD: validate " << ns << endl;
-            }
-
-            Client::ReadContext ctx(txn, ns_string.ns());
-
-            Database* db = ctx.ctx().db();
-            if ( !db ) {
-                errmsg = "database not found";
-                return false;
-            }
-
-            Collection* collection = db->getCollection( txn, ns );
-            if ( !collection ) {
-                errmsg = "collection not found";
-                return false;
-            }
-
-            result.append( "ns", ns );
-
-            ValidateResults results;
-            Status status = collection->validate( txn, full, scanData, &results, &result );
-            if ( !status.isOK() )
-                return appendCommandStatus( result, status );
-
-            result.appendBool("valid", results.valid);
-            result.append("errors", results.errors);
-
-            if ( !full ){
-                result.append("warning", "Some checks omitted for speed. use {full:true} option to do more thorough scan.");
-            }
-
-            if ( !results.valid ) {
-                result.append("advice", "ns corrupt. See http://dochub.mongodb.org/core/data-recovery");
-            }
-
-            return true;
+        if (!ns_string.isNormal() && full) {
+            errmsg = "Can only run full validate on a regular collection";
+            return false;
         }
 
-    } validateCmd;
+        if (!serverGlobalParams.quiet) {
+            LOG(0) << "CMD: validate " << ns << endl;
+        }
 
+        AutoGetDb ctx(txn, ns_string.db(), MODE_IX);
+        Lock::CollectionLock collLk(txn->lockState(), ns_string.ns(), MODE_X);
+        Collection* collection = ctx.getDb() ? ctx.getDb()->getCollection(ns_string) : NULL;
+        if (!collection) {
+            errmsg = "ns not found";
+            return false;
+        }
+
+        result.append("ns", ns);
+
+        ValidateResults results;
+        Status status = collection->validate(txn, full, scanData, &results, &result);
+        if (!status.isOK())
+            return appendCommandStatus(result, status);
+
+        if (!full) {
+            results.warnings.push_back(
+                "Some checks omitted for speed. use {full:true} option to do more thorough scan.");
+        }
+
+        result.appendBool("valid", results.valid);
+        result.append("warnings", results.warnings);
+        result.append("errors", results.errors);
+
+        if (!results.valid) {
+            result.append("advice",
+                          "A corrupt namespace has been detected. See "
+                          "http://dochub.mongodb.org/core/data-recovery for recovery steps.");
+        }
+
+        return true;
+    }
+
+} validateCmd;
 }

@@ -28,50 +28,82 @@
 
 #pragma once
 
+#include <string>
+
 #include "mongo/base/status.h"
 #include "mongo/db/jsobj.h"
 
 namespace mongo {
 
-    struct CollectionOptions {
-        CollectionOptions() {
-            reset();
-        }
+struct CollectionOptions {
+    CollectionOptions() {
+        reset();
+    }
 
-        void reset();
+    void reset();
 
-        Status parse( const BSONObj& obj );
-        BSONObj toBSON() const;
+    /**
+     * Returns true if collection options validates successfully.
+     */
+    bool isValid() const;
 
-        /**
-         * @param max in and out, will be adjusted
-         * @return if the value is valid at all
-         */
-        static bool validMaxCappedDocs( long long* max );
+    /**
+     * Confirms that collection options can be converted to BSON and back without errors.
+     */
+    Status validate() const;
 
-        // ----
+    /**
+     * Parses the "options" subfield of the collection info object.
+     */
+    Status parse(const BSONObj& obj);
 
-        bool capped;
-        long long cappedSize;
-        long long cappedMaxDocs;
+    BSONObj toBSON() const;
 
-        // following 2 are mutually exclusive, can only have one set
-        long long initialNumExtents;
-        std::vector<long long> initialExtentSizes;
+    /**
+     * @param max in and out, will be adjusted
+     * @return if the value is valid at all
+     */
+    static bool validMaxCappedDocs(long long* max);
 
-        // behavior of _id index creation when collection created
-        void setNoIdIndex() { autoIndexId = NO; }
-        enum {
-            DEFAULT, // currently yes for most collections, NO for some system ones
-            YES, // create _id index
-            NO // do not create _id index
-        } autoIndexId;
+    // ----
 
-        // user flags
-        int flags;
-        bool flagsSet;
+    bool capped;
+    long long cappedSize;
+    long long cappedMaxDocs;
 
-        bool temp;
+    // following 2 are mutually exclusive, can only have one set
+    long long initialNumExtents;
+    std::vector<long long> initialExtentSizes;
+
+    // behavior of _id index creation when collection created
+    void setNoIdIndex() {
+        autoIndexId = NO;
+    }
+    enum {
+        DEFAULT,  // currently yes for most collections, NO for some system ones
+        YES,      // create _id index
+        NO        // do not create _id index
+    } autoIndexId;
+
+    // user flags
+    enum UserFlags {
+        Flag_UsePowerOf2Sizes = 1 << 0,
+        Flag_NoPadding = 1 << 1,
     };
+    int flags;  // a bitvector of UserFlags
+    bool flagsSet;
 
+    bool temp;
+
+    // Storage engine collection options. Always owned or empty.
+    BSONObj storageEngine;
+
+    // Default options for indexes created on the collection. Always owned or empty.
+    BSONObj indexOptionDefaults;
+
+    // Always owned or empty.
+    BSONObj validator;
+    std::string validationAction;
+    std::string validationLevel;
+};
 }

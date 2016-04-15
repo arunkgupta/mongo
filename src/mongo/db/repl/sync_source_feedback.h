@@ -29,98 +29,50 @@
 
 #pragma once
 
-#include "mongo/db/repl/oplogreader.h"
-#include "mongo/client/constants.h"
-#include "mongo/client/dbclientcursor.h"
-#include "mongo/util/background.h"
-#include "mongo/util/log.h"
+#include "mongo/base/status.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
 
 namespace mongo {
+struct HostAndPort;
+class OperationContext;
+
 namespace repl {
+class Reporter;
 
-    class Member;
+class SyncSourceFeedback {
+public:
+    /// Notifies the SyncSourceFeedbackThread to wake up and send an update upstream of slave
+    /// replication progress.
+    void forwardSlaveProgress();
 
-    class SyncSourceFeedback : public BackgroundJob {
-    public:
-        SyncSourceFeedback() : BackgroundJob(false /*don't selfdelete*/),
-                              _syncTarget(NULL),
-                              _positionChanged(false),
-                              _handshakeNeeded(false) {}
+    /**
+     * Loops continuously until shutdown() is called, passing updates when they are present. If no
+     * update occurs within the _keepAliveInterval, progress is forwarded to let the upstream node
+     * know that this node, along with the alive nodes chaining through it, are still alive.
+     */
+    void run();
 
-        ~SyncSourceFeedback() {}
+    /// Signals the run() method to terminate.
+    void shutdown();
 
-        /// Adds an entry to _members for a secondary that has connected to us.
-        void associateMember(const BSONObj& id, Member* member);
+private:
+    /* Inform the sync target of our current position in the oplog, as well as the positions
+     * of all secondaries chained through us.
+     */
+    Status _updateUpstream(OperationContext* txn);
 
-        /// Ensures local.me is populated and populates it if not.
-        void ensureMe();
+    // protects cond, _shutdownSignaled, _keepAliveInterval, and _positionChanged.
+    stdx::mutex _mtx;
+    // used to alert our thread of changes which need to be passed up the chain
+    stdx::condition_variable _cond;
+    // used to indicate a position change which has not yet been pushed along
+    bool _positionChanged = false;
+    // Once this is set to true the _run method will terminate
+    bool _shutdownSignaled = false;
+    // Reports replication progress to sync source.
+    Reporter* _reporter = nullptr;
+};
 
-        /// Passes handshake up the replication chain, upon receiving a handshake.
-        void forwardSlaveHandshake();
-
-        void updateSelfInMap(const OpTime& ot) {
-            updateMap(_me["_id"].OID(), ot);
-        }
-
-        /// Updates the _slaveMap to be forwarded to the sync target.
-        void updateMap(const mongo::OID& rid, const OpTime& ot);
-
-        std::string name() const { return "SyncSourceFeedbackThread"; }
-
-        /// Loops forever, passing updates when they are present.
-        void run();
-
-    private:
-        void _resetConnection() {
-            MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kReplication);
-
-            LOG(1) << "resetting connection in sync source feedback";
-            _connection.reset();
-        }
-
-        /**
-         * Authenticates _connection using the server's cluster-membership credentials.
-         *
-         * Returns true on successful authentication.
-         */
-        bool replAuthenticate();
-
-        /* Sends initialization information to our sync target, also determines whether or not they
-         * support the updater command.
-         */
-        bool replHandshake();
-
-        /* Inform the sync target of our current position in the oplog, as well as the positions
-         * of all secondaries chained through us.
-         */
-        bool updateUpstream();
-
-        bool hasConnection() {
-            return _connection.get();
-        }
-
-        /// Connect to sync target.
-        bool _connect(const std::string& hostName);
-
-        // stores our OID to be passed along in commands
-        BSONObj _me;
-        // the member we are currently syncing from
-        const Member* _syncTarget;
-        // our connection to our sync target
-        boost::scoped_ptr<DBClientConnection> _connection;
-        // protects cond and maps and the indicator bools
-        boost::mutex _mtx;
-        // contains the most recent optime of each member syncing to us
-        std::map<mongo::OID, OpTime> _slaveMap;
-        typedef std::map<mongo::OID, Member*> OIDMemberMap;
-        // contains a pointer to each member, which we can look up by oid
-        OIDMemberMap _members;
-        // used to alert our thread of changes which need to be passed up the chain
-        boost::condition _cond;
-        // used to indicate a position change which has not yet been pushed along
-        bool _positionChanged;
-        // used to indicate a connection change which has not yet been shook on
-        bool _handshakeNeeded;
-    };
-} // namespace repl
-} // namespace mongo
+}  // namespace repl
+}  // namespace mongo

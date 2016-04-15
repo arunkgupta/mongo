@@ -29,11 +29,19 @@
 #include "mongo/platform/basic.h"
 
 #include <map>
-#include <boost/thread/thread.hpp>
 
-#include "mongo/db/repl/network_interface_mock.h"
+#include "mongo/base/init.h"
+#include "mongo/executor/task_executor_test_common.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/replication_executor.h"
+#include "mongo/db/repl/replication_executor_test_fixture.h"
+#include "mongo/db/repl/storage_interface_mock.h"
+#include "mongo/executor/network_interface_mock.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/stdx/functional.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/unittest/barrier.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/map_util.h"
@@ -43,330 +51,205 @@ namespace repl {
 
 namespace {
 
-    bool operator==(const ReplicationExecutor::RemoteCommandRequest lhs,
-                    const ReplicationExecutor::RemoteCommandRequest rhs) {
-        return lhs.target == rhs.target &&
-            lhs.dbname == rhs.dbname &&
-            lhs.cmdObj == rhs.cmdObj;
-    }
+using executor::NetworkInterfaceMock;
+using unittest::assertGet;
 
-    bool operator!=(const ReplicationExecutor::RemoteCommandRequest lhs,
-                    const ReplicationExecutor::RemoteCommandRequest rhs) {
-        return !(lhs == rhs);
-    }
+const int64_t prngSeed = 1;
 
-    void setStatus(const ReplicationExecutor::CallbackData& cbData, Status* target) {
-        *target = cbData.status;
-    }
+MONGO_INITIALIZER(ReplExecutorCommonTests)(InitializerContext*) {
+    mongo::executor::addTestsForExecutor(
+        "ReplicationExecutorCommon",
+        [](std::unique_ptr<executor::NetworkInterfaceMock>* net) {
+            return stdx::make_unique<ReplicationExecutor>(
+                net->release(), new StorageInterfaceMock(), prngSeed);
+        });
+    return Status::OK();
+}
 
-    void setStatusAndShutdown(const ReplicationExecutor::CallbackData& cbData,
-                              Status* target) {
-        setStatus(cbData, target);
+TEST_F(ReplicationExecutorTest, ScheduleDBWorkAndExclusiveWorkConcurrently) {
+    unittest::Barrier barrier(2U);
+    NamespaceString nss("mydb", "mycoll");
+    ReplicationExecutor& executor = getReplExecutor();
+    Status status1 = getDetectableErrorStatus();
+    OperationContext* txn = nullptr;
+    using CallbackData = ReplicationExecutor::CallbackArgs;
+    ASSERT_OK(executor.scheduleDBWork([&](const CallbackData& cbData) {
+        status1 = cbData.status;
+        txn = cbData.txn;
+        barrier.countDownAndWait();
         if (cbData.status != ErrorCodes::CallbackCanceled)
             cbData.executor->shutdown();
-    }
+    }).getStatus());
+    ASSERT_OK(executor.scheduleWorkWithGlobalExclusiveLock([&](const CallbackData& cbData) {
+        barrier.countDownAndWait();
+    }).getStatus());
+    executor.run();
+    ASSERT_OK(status1);
+    ASSERT(txn);
+}
 
-    void setStatusAndTriggerEvent(const ReplicationExecutor::CallbackData& cbData,
-                                  Status* outStatus,
-                                  ReplicationExecutor::EventHandle event) {
-        *outStatus = cbData.status;
-        if (!cbData.status.isOK())
-            return;
-        cbData.executor->signalEvent(event);
-    }
+TEST_F(ReplicationExecutorTest, ScheduleDBWorkWithCollectionLock) {
+    NamespaceString nss("mydb", "mycoll");
+    ReplicationExecutor& executor = getReplExecutor();
+    Status status1 = getDetectableErrorStatus();
+    OperationContext* txn = nullptr;
+    bool collectionIsLocked = false;
+    using CallbackData = ReplicationExecutor::CallbackArgs;
+    ASSERT_OK(executor.scheduleDBWork([&](const CallbackData& cbData) {
+        status1 = cbData.status;
+        txn = cbData.txn;
+        collectionIsLocked =
+            txn ? txn->lockState()->isCollectionLockedForMode(nss.ns(), MODE_X) : false;
+        if (cbData.status != ErrorCodes::CallbackCanceled)
+            cbData.executor->shutdown();
+    }, nss, MODE_X).getStatus());
+    executor.run();
+    ASSERT_OK(status1);
+    ASSERT(txn);
+    ASSERT_TRUE(collectionIsLocked);
+}
 
-    void scheduleSetStatusAndShutdown(const ReplicationExecutor::CallbackData& cbData,
-                                      Status* outStatus1,
-                                      Status* outStatus2) {
-        if (!cbData.status.isOK()) {
-            *outStatus1 = cbData.status;
-            return;
-        }
-        *outStatus1= cbData.executor->scheduleWork(stdx::bind(setStatusAndShutdown,
-                                                            stdx::placeholders::_1,
-                                                            outStatus2)).getStatus();
-    }
+TEST_F(ReplicationExecutorTest, ScheduleExclusiveLockOperation) {
+    ReplicationExecutor& executor = getReplExecutor();
+    Status status1 = getDetectableErrorStatus();
+    OperationContext* txn = nullptr;
+    bool lockIsW = false;
+    using CallbackData = ReplicationExecutor::CallbackArgs;
+    ASSERT_OK(executor.scheduleWorkWithGlobalExclusiveLock([&](const CallbackData& cbData) {
+        status1 = cbData.status;
+        txn = cbData.txn;
+        lockIsW = txn ? txn->lockState()->isW() : false;
+        if (cbData.status != ErrorCodes::CallbackCanceled)
+            cbData.executor->shutdown();
+    }).getStatus());
+    executor.run();
+    ASSERT_OK(status1);
+    ASSERT(txn);
+    ASSERT_TRUE(lockIsW);
+}
 
-    TEST(ReplicationExecutor, RunOne) {
-        ReplicationExecutor executor(new NetworkInterfaceMock);
-        Status status(ErrorCodes::InternalError, "Not mutated");
-        ASSERT_OK(executor.scheduleWork(stdx::bind(setStatusAndShutdown,
-                                                   stdx::placeholders::_1,
-                                                   &status)).getStatus());
-        executor.run();
-        ASSERT_OK(status);
-    }
+TEST_F(ReplicationExecutorTest, ShutdownBeforeRunningSecondExclusiveLockOperation) {
+    ReplicationExecutor& executor = getReplExecutor();
+    using CallbackData = ReplicationExecutor::CallbackArgs;
+    Status status1 = getDetectableErrorStatus();
+    ASSERT_OK(executor.scheduleWorkWithGlobalExclusiveLock([&](const CallbackData& cbData) {
+        status1 = cbData.status;
+        if (cbData.status != ErrorCodes::CallbackCanceled)
+            cbData.executor->shutdown();
+    }).getStatus());
+    // Second db work item is invoked by the main executor thread because the work item is
+    // moved from the exclusive lock queue to the ready work item queue when the first callback
+    // cancels the executor.
+    Status status2 = getDetectableErrorStatus();
+    ASSERT_OK(executor.scheduleWorkWithGlobalExclusiveLock([&](const CallbackData& cbData) {
+        status2 = cbData.status;
+        if (cbData.status != ErrorCodes::CallbackCanceled)
+            cbData.executor->shutdown();
+    }).getStatus());
+    executor.run();
+    ASSERT_OK(status1);
+    ASSERT_EQUALS(ErrorCodes::CallbackCanceled, status2.code());
+}
 
-    TEST(ReplicationExecutor, Schedule1ButShutdown) {
-        ReplicationExecutor executor(new NetworkInterfaceMock);
-        Status status(ErrorCodes::InternalError, "Not mutated");
-        ASSERT_OK(executor.scheduleWork(stdx::bind(setStatusAndShutdown,
-                                                   stdx::placeholders::_1,
-                                                   &status)).getStatus());
-        executor.shutdown();
-        executor.run();
-        ASSERT_EQUALS(status, ErrorCodes::CallbackCanceled);
-    }
+TEST_F(ReplicationExecutorTest, CancelBeforeRunningFutureWork) {
+    ReplicationExecutor& executor = getReplExecutor();
+    using CallbackData = ReplicationExecutor::CallbackArgs;
+    Status status1 = getDetectableErrorStatus();
+    auto cbhWithStatus =
+        executor.scheduleWorkAt(executor.now() + Milliseconds(1000),
+                                [&](const CallbackData& cbData) {
+                                    status1 = cbData.status;
+                                    if (cbData.status != ErrorCodes::CallbackCanceled)
+                                        cbData.executor->shutdown();
+                                });
+    ASSERT_OK(cbhWithStatus.getStatus());
 
-    TEST(ReplicationExecutor, Schedule2Cancel1) {
-        ReplicationExecutor executor(new NetworkInterfaceMock);
-        Status status1(ErrorCodes::InternalError, "Not mutated");
-        Status status2(ErrorCodes::InternalError, "Not mutated");
-        ReplicationExecutor::CallbackHandle cb = unittest::assertGet(
-            executor.scheduleWork(stdx::bind(setStatusAndShutdown,
-                                             stdx::placeholders::_1,
-                                             &status1)));
-        executor.cancel(cb);
-        ASSERT_OK(executor.scheduleWork(stdx::bind(setStatusAndShutdown,
-                                                   stdx::placeholders::_1,
-                                                   &status2)).getStatus());
-        executor.run();
-        ASSERT_EQUALS(status1, ErrorCodes::CallbackCanceled);
-        ASSERT_OK(status2);
-    }
+    ASSERT_EQUALS(1, executor.getDiagnosticBSON().getFieldDotted("queues.sleepers").Int());
+    ASSERT_EQUALS(0, executor.getDiagnosticBSON().getFieldDotted("queues.ready").Int());
+    executor.cancel(cbhWithStatus.getValue());
 
-    TEST(ReplicationExecutor, OneSchedulesAnother) {
-        ReplicationExecutor executor(new NetworkInterfaceMock);
-        Status status1(ErrorCodes::InternalError, "Not mutated");
-        Status status2(ErrorCodes::InternalError, "Not mutated");
-        ASSERT_OK(executor.scheduleWork(stdx::bind(scheduleSetStatusAndShutdown,
-                                                   stdx::placeholders::_1,
-                                                   &status1,
-                                                   &status2)).getStatus());
-        executor.run();
-        ASSERT_OK(status1);
-        ASSERT_OK(status2);
-    }
+    ASSERT_EQUALS(0, executor.getDiagnosticBSON().getFieldDotted("queues.sleepers").Int());
+    ASSERT_EQUALS(1, executor.getDiagnosticBSON().getFieldDotted("queues.ready").Int());
+}
 
-    class EventChainAndWaitingTest {
-        MONGO_DISALLOW_COPYING(EventChainAndWaitingTest);
-    public:
-        EventChainAndWaitingTest();
-        void run();
-    private:
-        void onGo(const ReplicationExecutor::CallbackData& cbData);
-        void onGoAfterTriggered(const ReplicationExecutor::CallbackData& cbData);
+// Equivalent to EventChainAndWaitingTest::onGo
+TEST_F(ReplicationExecutorTest, ScheduleCallbackOnFutureEvent) {
+    launchExecutorThread();
+    getNet()->exitNetwork();
 
-        ReplicationExecutor executor;
-        boost::thread executorThread;
-        const ReplicationExecutor::EventHandle goEvent;
-        const ReplicationExecutor::EventHandle event2;
-        const ReplicationExecutor::EventHandle event3;
-        ReplicationExecutor::EventHandle triggerEvent;
-        ReplicationExecutor::CallbackFn  triggered2;
-        ReplicationExecutor::CallbackFn  triggered3;
-        Status status1;
-        Status status2;
-        Status status3;
-        Status status4;
-        Status status5;
+    ReplicationExecutor& executor = getReplExecutor();
+    // We signal this "ping" event and the executor will signal "pong" event in return.
+    auto ping = assertGet(executor.makeEvent());
+    auto pong = assertGet(executor.makeEvent());
+    auto fn = [&executor, pong](const ReplicationExecutor::CallbackArgs& cbData) {
+        ASSERT_OK(cbData.status);
+        executor.signalEvent(pong);
     };
 
-    TEST(ReplicationExecutor, EventChainAndWaiting) {
-        EventChainAndWaitingTest().run();
-    }
+    // Wait for a future event.
+    executor.onEvent(ping, fn);
+    ASSERT_EQUALS(0, executor.getDiagnosticBSON().getFieldDotted("queues.ready").Int());
+    executor.signalEvent(ping);
+    executor.waitForEvent(pong);
+}
 
-    EventChainAndWaitingTest::EventChainAndWaitingTest() :
-        executor(new NetworkInterfaceMock),
-        executorThread(stdx::bind(&ReplicationExecutor::run, &executor)),
-        goEvent(unittest::assertGet(executor.makeEvent())),
-        event2(unittest::assertGet(executor.makeEvent())),
-        event3(unittest::assertGet(executor.makeEvent())),
-        status1(ErrorCodes::InternalError, "Not mutated"),
-        status2(ErrorCodes::InternalError, "Not mutated"),
-        status3(ErrorCodes::InternalError, "Not mutated"),
-        status4(ErrorCodes::InternalError, "Not mutated"),
-        status5(ErrorCodes::InternalError, "Not mutated") {
+// Equivalent to EventChainAndWaitingTest::onGoAfterTriggered
+TEST_F(ReplicationExecutorTest, ScheduleCallbackOnSignaledEvent) {
+    launchExecutorThread();
+    getNet()->exitNetwork();
 
-        triggered2 = stdx::bind(setStatusAndTriggerEvent,
-                                stdx::placeholders::_1,
-                                &status2,
-                                event2);
-        triggered3 = stdx::bind(setStatusAndTriggerEvent,
-                                stdx::placeholders::_1,
-                                &status3,
-                                event3);
-    }
+    ReplicationExecutor& executor = getReplExecutor();
+    // We signal this "ping" event and the executor will signal "pong" event in return.
+    auto ping = assertGet(executor.makeEvent());
+    auto pong = assertGet(executor.makeEvent());
+    auto fn = [&executor, pong](const ReplicationExecutor::CallbackArgs& cbData) {
+        ASSERT_OK(cbData.status);
+        executor.signalEvent(pong);
+    };
 
-    void EventChainAndWaitingTest::run() {
-        executor.onEvent(goEvent,
-                         stdx::bind(&EventChainAndWaitingTest::onGo,
-                                    this,
-                                    stdx::placeholders::_1));
-        executor.signalEvent(goEvent);
-        executor.waitForEvent(goEvent);
-        executor.waitForEvent(event2);
-        executor.waitForEvent(event3);
+    // Wait for a signaled event.
+    executor.signalEvent(ping);
+    executor.onEvent(ping, fn);
+    executor.waitForEvent(pong);
+}
 
-        ReplicationExecutor::EventHandle neverSignaledEvent =
-            unittest::assertGet(executor.makeEvent());
-        boost::thread neverSignaledWaiter(stdx::bind(&ReplicationExecutor::waitForEvent,
-                                                     &executor,
-                                                     neverSignaledEvent));
-        ReplicationExecutor::CallbackHandle shutdownCallback = unittest::assertGet(
-                executor.scheduleWork(stdx::bind(setStatusAndShutdown,
-                                                 stdx::placeholders::_1,
-                                                 &status5)));
-        executor.wait(shutdownCallback);
-        neverSignaledWaiter.join();
-        executorThread.join();
-        ASSERT_OK(status1);
-        ASSERT_OK(status2);
-        ASSERT_OK(status3);
-        ASSERT_OK(status4);
-        ASSERT_OK(status5);
-    }
+TEST_F(ReplicationExecutorTest, ScheduleCallbackAtNow) {
+    launchExecutorThread();
+    getNet()->exitNetwork();
 
-    void EventChainAndWaitingTest::onGo(const ReplicationExecutor::CallbackData& cbData) {
-        if (!cbData.status.isOK()) {
-            status1 = cbData.status;
-            return;
-        }
-        ReplicationExecutor* executor = cbData.executor;
-        StatusWith<ReplicationExecutor::EventHandle> errorOrTriggerEvent = executor->makeEvent();
-        if (!errorOrTriggerEvent.isOK()) {
-            status1 = errorOrTriggerEvent.getStatus();
-            executor->shutdown();
-            return;
-        }
-        triggerEvent = errorOrTriggerEvent.getValue();
-        StatusWith<ReplicationExecutor::CallbackHandle> cbHandle = executor->onEvent(
-                triggerEvent, triggered2);
-        if (!cbHandle.isOK()) {
-            status1 = cbHandle.getStatus();
-            executor->shutdown();
-            return;
-        }
-        cbHandle = executor->onEvent(triggerEvent, triggered3);
-        if (!cbHandle.isOK()) {
-            status1 = cbHandle.getStatus();
-            executor->shutdown();
-            return;
-        }
+    ReplicationExecutor& executor = getReplExecutor();
+    auto finishEvent = assertGet(executor.makeEvent());
+    auto fn = [&executor, finishEvent](const ReplicationExecutor::CallbackArgs& cbData) {
+        ASSERT_OK(cbData.status);
+        executor.signalEvent(finishEvent);
+    };
 
-        cbHandle = executor->onEvent(
-                goEvent,
-                stdx::bind(&EventChainAndWaitingTest::onGoAfterTriggered,
-                           this,
-                           stdx::placeholders::_1));
-        if (!cbHandle.isOK()) {
-            status1 = cbHandle.getStatus();
-            executor->shutdown();
-            return;
-        }
-        status1 = Status::OK();
-    }
+    auto cb = executor.scheduleWorkAt(getNet()->now(), fn);
+    executor.waitForEvent(finishEvent);
+}
 
-    void EventChainAndWaitingTest::onGoAfterTriggered(
-            const ReplicationExecutor::CallbackData& cbData) {
-        status4 = cbData.status;
-        if (!cbData.status.isOK()) {
-            return;
-        }
-        cbData.executor->signalEvent(triggerEvent);
-    }
+TEST_F(ReplicationExecutorTest, ScheduleCallbackAtAFutureTime) {
+    launchExecutorThread();
+    getNet()->exitNetwork();
 
-    TEST(ReplicationExecutor, ScheduleWorkAt) {
-        NetworkInterfaceMock* net = new NetworkInterfaceMock;
-        ReplicationExecutor executor(net);
-        Status status1(ErrorCodes::InternalError, "Not mutated");
-        Status status2(ErrorCodes::InternalError, "Not mutated");
-        Status status3(ErrorCodes::InternalError, "Not mutated");
-        const Date_t now = net->now();
-        unittest::assertGet(executor.scheduleWorkAt(Date_t(now.millis + 100),
-                                                    stdx::bind(setStatus,
-                                                               stdx::placeholders::_1,
-                                                               &status1)));
-        unittest::assertGet(executor.scheduleWorkAt(Date_t(now.millis + 5000),
-                                                    stdx::bind(setStatus,
-                                                               stdx::placeholders::_1,
-                                                               &status3)));
-        unittest::assertGet(executor.scheduleWorkAt(Date_t(now.millis + 200),
-                                                    stdx::bind(setStatusAndShutdown,
-                                                               stdx::placeholders::_1,
-                                                               &status2)));
-        executor.run();
-        ASSERT_OK(status1);
-        ASSERT_OK(status2);
-        ASSERT_EQUALS(status3, ErrorCodes::CallbackCanceled);
-    }
+    ReplicationExecutor& executor = getReplExecutor();
+    auto finishEvent = assertGet(executor.makeEvent());
+    auto fn = [&executor, finishEvent](const ReplicationExecutor::CallbackArgs& cbData) {
+        ASSERT_OK(cbData.status);
+        executor.signalEvent(finishEvent);
+    };
 
-    std::string getRequestDescription(const ReplicationExecutor::RemoteCommandRequest& request) {
-        return mongoutils::str::stream() << "Request(" << request.target.toString() << ", " <<
-            request.dbname << ", " << request.cmdObj << ')';
-    }
+    auto now = getNet()->now();
+    now += Milliseconds(1000);
+    auto cb = executor.scheduleWorkAt(now, fn);
 
-    static void setStatusOnRemoteCommandCompletion(
-            const ReplicationExecutor::RemoteCommandCallbackData& cbData,
-            const ReplicationExecutor::RemoteCommandRequest& expectedRequest,
-            Status* outStatus) {
+    getNet()->enterNetwork();
+    getNet()->runUntil(now);
+    getNet()->exitNetwork();
 
-        if (cbData.request != expectedRequest) {
-            *outStatus = Status(
-                    ErrorCodes::BadValue,
-                    mongoutils::str::stream() << "Actual request: " <<
-                    getRequestDescription(cbData.request) << "; expected: " <<
-                    getRequestDescription(expectedRequest));
-            return;
-        }
-        *outStatus = cbData.response.getStatus();
-    }
+    executor.waitForEvent(finishEvent);
+}
 
-    TEST(ReplicationExecutor, ScheduleRemoteCommand) {
-        NetworkInterfaceMock* net = new NetworkInterfaceMock;
-        ReplicationExecutor executor(net);
-        Status status1(ErrorCodes::InternalError, "Not mutated");
-        const ReplicationExecutor::RemoteCommandRequest request(
-                HostAndPort("localhost", 27017),
-                "mydb",
-                BSON("whatsUp" << "doc"));
-        ReplicationExecutor::CallbackHandle cbHandle = unittest::assertGet(
-                executor.scheduleRemoteCommand(
-                        request,
-                        stdx::bind(setStatusOnRemoteCommandCompletion,
-                                   stdx::placeholders::_1,
-                                   request,
-                                   &status1)));
-        boost::thread executorThread(stdx::bind(&ReplicationExecutor::run, &executor));
-        executor.wait(cbHandle);
-        executor.shutdown();
-        executorThread.join();
-        ASSERT_EQUALS(ErrorCodes::NoSuchKey, status1);
-    }
-
-    TEST(ReplicationExecutor, ScheduleAndCancelRemoteCommand) {
-        NetworkInterfaceMock* net = new NetworkInterfaceMock;
-        ReplicationExecutor executor(net);
-        Status status1(ErrorCodes::InternalError, "Not mutated");
-        const ReplicationExecutor::RemoteCommandRequest request(
-                HostAndPort("localhost", 27017),
-                "mydb",
-                BSON("whatsUp" << "doc"));
-        ReplicationExecutor::CallbackHandle cbHandle = unittest::assertGet(
-                executor.scheduleRemoteCommand(
-                        request,
-                        stdx::bind(setStatusOnRemoteCommandCompletion,
-                                   stdx::placeholders::_1,
-                                   request,
-                                   &status1)));
-        executor.cancel(cbHandle);
-        boost::thread executorThread(stdx::bind(&ReplicationExecutor::run, &executor));
-        executor.wait(cbHandle);
-        executor.shutdown();
-        executorThread.join();
-        ASSERT_EQUALS(ErrorCodes::CallbackCanceled, status1);
-    }
-
-    TEST(ReplicationExecutor, ScheduleExclusiveLockOperation) {
-        ReplicationExecutor executor(new NetworkInterfaceMock);
-        Status status1(ErrorCodes::InternalError, "Not mutated");
-        ASSERT_OK(executor.scheduleWorkWithGlobalExclusiveLock(
-                          stdx::bind(setStatusAndShutdown,
-                                     stdx::placeholders::_1,
-                                     &status1)).getStatus());
-        executor.run();
-        ASSERT_OK(status1);
-    }
 
 }  // namespace
 }  // namespace repl

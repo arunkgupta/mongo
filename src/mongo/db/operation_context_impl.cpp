@@ -26,166 +26,192 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/operation_context_impl.h"
 
+#include <memory>
+
 #include "mongo/db/client.h"
+#include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/curop.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/platform/random.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/util/fail_point_service.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 
-    OperationContextImpl::OperationContextImpl() {
-        invariant( globalStorageEngine );
-        _recovery.reset(globalStorageEngine->newRecoveryUnit(this));
+namespace {
+std::unique_ptr<Locker> newLocker() {
+    if (isMMAPV1())
+        return stdx::make_unique<MMAPV1LockerImpl>();
+    return stdx::make_unique<DefaultLockerImpl>();
+}
 
-        getGlobalEnvironment()->registerOperationContext(this);
-    }
-
-    OperationContextImpl::~OperationContextImpl() {
-        getGlobalEnvironment()->unregisterOperationContext(this);
-    }
-
-    RecoveryUnit* OperationContextImpl::recoveryUnit() const {
-        return _recovery.get();
-    }
-
-    LockState* OperationContextImpl::lockState() const {
-        // TODO: This will eventually become member of OperationContextImpl
-        return &cc().lockState();
-    }
-
-    ProgressMeter* OperationContextImpl::setMessage(const char * msg,
-                                                    const std::string &name,
-                                                    unsigned long long progressMeterTotal,
-                                                    int secondsBetween) {
-        return &getCurOp()->setMessage(msg, name, progressMeterTotal, secondsBetween);
-    }
-
-    const char* OperationContextImpl::getNS() const {
-        return getCurOp()->getNS();
-    }
-
-    Client* OperationContextImpl::getClient() const {
-        return &cc();
-    }
-
-    CurOp* OperationContextImpl::getCurOp() const {
-        return cc().curop();
-    }
-
-    // Enabling the checkForInterruptFail fail point will start a game of random chance on the
-    // connection specified in the fail point data, generating an interrupt with a given fixed
-    // probability.  Example invocation:
-    //
-    // {configureFailPoint: "checkForInterruptFail",
-    //  mode: "alwaysOn",
-    //  data: {conn: 17, chance: .01, allowNested: true}}
-    //
-    // All three data fields must be specified.  In the above example, all interrupt points on
-    // connection 17 will generate a kill on the current operation with probability p(.01),
-    // including interrupt points of nested operations.  If "allowNested" is false, nested
-    // operations are not targeted.  "chance" must be a double between 0 and 1, inclusive.
-    MONGO_FP_DECLARE(checkForInterruptFail);
-
-    namespace {
-
-        // Global state for checkForInterrupt fail point.
-        PseudoRandom checkForInterruptPRNG(static_cast<int64_t>(time(NULL)));
-
-        // Helper function for checkForInterrupt fail point.  Decides whether the operation currently
-        // being run by the given Client meet the (probabilistic) conditions for interruption as
-        // specified in the fail point info.
-        bool opShouldFail(const Client& c, const BSONObj& failPointInfo) {
-            // Only target the client with the specified connection number.
-            if (c.getConnectionId() != failPointInfo["conn"].safeNumberLong()) {
-                return false;
-            }
-
-            // Only target nested operations if requested.
-            if (!failPointInfo["allowNested"].trueValue() && c.curop()->parent() != NULL) {
-                return false;
-            }
-
-            // Return true with (approx) probability p = "chance".  Recall: 0 <= chance <= 1.
-            double next = static_cast<double>(std::abs(checkForInterruptPRNG.nextInt64()));
-            double upperBound =
-                std::numeric_limits<int64_t>::max() * failPointInfo["chance"].numberDouble();
-            if (next > upperBound) {
-                return false;
-            }
-            return true;
+class ClientOperationInfo {
+public:
+    Locker* getLocker() {
+        if (!_locker) {
+            _locker = newLocker();
         }
+        return _locker.get();
+    }
 
-    } // namespace
+private:
+    std::unique_ptr<Locker> _locker;
+};
 
-    void OperationContextImpl::checkForInterrupt(bool heedMutex) const {
-        Client& c = cc();
+const auto clientOperationInfoDecoration = Client::declareDecoration<ClientOperationInfo>();
 
-        if (heedMutex && lockState()->isWriteLocked() && c.hasWrittenSinceCheckpoint()) {
-            return;
-        }
+AtomicUInt32 nextOpId{1};
+}  // namespace
 
-        uassert(ErrorCodes::InterruptedAtShutdown,
-                "interrupted at shutdown",
-                !getGlobalEnvironment()->getKillAllOperations());
+using std::string;
 
-        if (c.curop()->maxTimeHasExpired()) {
-            c.curop()->kill();
-            uasserted(ErrorCodes::ExceededTimeLimit, "operation exceeded time limit");
-        }
+OperationContextImpl::OperationContextImpl()
+    : OperationContext(
+          &cc(), nextOpId.fetchAndAdd(1), clientOperationInfoDecoration(cc()).getLocker()),
+      _writesAreReplicated(true) {
+    StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
+    _recovery.reset(storageEngine->newRecoveryUnit());
 
-        MONGO_FAIL_POINT_BLOCK(checkForInterruptFail, scopedFailPoint) {
-            if (opShouldFail(c, scopedFailPoint.getData())) {
-                log() << "set pending kill on " << (c.curop()->parent() ? "nested" : "top-level")
-                      << " op " << c.curop()->opNum().get() << ", for checkForInterruptFail";
-                c.curop()->kill();
-            }
-        }
+    auto client = getClient();
+    stdx::lock_guard<Client> lk(*client);
+    client->setOperationContext(this);
+}
 
-        if (c.curop()->killPending()) {
-            uasserted(11601, "operation was interrupted");
+OperationContextImpl::~OperationContextImpl() {
+    lockState()->assertEmptyAndReset();
+    auto client = getClient();
+    stdx::lock_guard<Client> lk(*client);
+    client->resetOperationContext();
+}
+
+RecoveryUnit* OperationContextImpl::recoveryUnit() const {
+    return _recovery.get();
+}
+
+RecoveryUnit* OperationContextImpl::releaseRecoveryUnit() {
+    return _recovery.release();
+}
+
+OperationContext::RecoveryUnitState OperationContextImpl::setRecoveryUnit(RecoveryUnit* unit,
+                                                                          RecoveryUnitState state) {
+    _recovery.reset(unit);
+    RecoveryUnitState oldState = _ruState;
+    _ruState = state;
+    return oldState;
+}
+
+ProgressMeter* OperationContextImpl::setMessage_inlock(const char* msg,
+                                                       const std::string& name,
+                                                       unsigned long long progressMeterTotal,
+                                                       int secondsBetween) {
+    return &CurOp::get(this)->setMessage_inlock(msg, name, progressMeterTotal, secondsBetween);
+}
+
+string OperationContextImpl::getNS() const {
+    return CurOp::get(this)->getNS();
+}
+
+uint64_t OperationContextImpl::getRemainingMaxTimeMicros() const {
+    return CurOp::get(this)->getRemainingMaxTimeMicros();
+}
+
+// Enabling the checkForInterruptFail fail point will start a game of random chance on the
+// connection specified in the fail point data, generating an interrupt with a given fixed
+// probability.  Example invocation:
+//
+// {configureFailPoint: "checkForInterruptFail",
+//  mode: "alwaysOn",
+//  data: {conn: 17, chance: .01, allowNested: true}}
+//
+// All three data fields must be specified.  In the above example, all interrupt points on
+// connection 17 will generate a kill on the current operation with probability p(.01),
+// including interrupt points of nested operations.  If "allowNested" is false, nested
+// operations are not targeted.  "chance" must be a double between 0 and 1, inclusive.
+MONGO_FP_DECLARE(checkForInterruptFail);
+
+namespace {
+
+// Helper function for checkForInterrupt fail point.  Decides whether the operation currently
+// being run by the given Client meet the (probabilistic) conditions for interruption as
+// specified in the fail point info.
+bool opShouldFail(const OperationContextImpl* opCtx, const BSONObj& failPointInfo) {
+    // Only target the client with the specified connection number.
+    if (opCtx->getClient()->getConnectionId() != failPointInfo["conn"].safeNumberLong()) {
+        return false;
+    }
+
+    // Only target nested operations if requested.
+    if (!failPointInfo["allowNested"].trueValue() && CurOp::get(opCtx)->parent() != NULL) {
+        return false;
+    }
+
+    // Return true with (approx) probability p = "chance".  Recall: 0 <= chance <= 1.
+    double next = static_cast<double>(std::abs(opCtx->getClient()->getPrng().nextInt64()));
+    double upperBound =
+        std::numeric_limits<int64_t>::max() * failPointInfo["chance"].numberDouble();
+    if (next > upperBound) {
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+void OperationContextImpl::checkForInterrupt() {
+    // We cannot interrupt operation, while it's inside of a write unit of work, because logOp
+    // cannot handle being iterrupted.
+    if (lockState()->inAWriteUnitOfWork())
+        return;
+
+    uassertStatusOK(checkForInterruptNoAssert());
+}
+
+Status OperationContextImpl::checkForInterruptNoAssert() {
+    if (getGlobalServiceContext()->getKillAllOperations()) {
+        return Status(ErrorCodes::InterruptedAtShutdown, "interrupted at shutdown");
+    }
+
+    CurOp* curOp = CurOp::get(this);
+    if (curOp->maxTimeHasExpired()) {
+        markKilled();
+        return Status(ErrorCodes::ExceededTimeLimit, "operation exceeded time limit");
+    }
+
+    MONGO_FAIL_POINT_BLOCK(checkForInterruptFail, scopedFailPoint) {
+        if (opShouldFail(this, scopedFailPoint.getData())) {
+            log() << "set pending kill on " << (curOp->parent() ? "nested" : "top-level") << " op "
+                  << getOpID() << ", for checkForInterruptFail";
+            markKilled();
         }
     }
 
-    Status OperationContextImpl::checkForInterruptNoAssert() const {
-        Client& c = cc();
-
-        if (getGlobalEnvironment()->getKillAllOperations()) {
-            return Status(ErrorCodes::Interrupted, "interrupted at shutdown");
-        }
-
-        if (c.curop()->maxTimeHasExpired()) {
-            c.curop()->kill();
-            return Status(ErrorCodes::Interrupted, "exceeded time limit");
-        }
-
-        MONGO_FAIL_POINT_BLOCK(checkForInterruptFail, scopedFailPoint) {
-            if (opShouldFail(c, scopedFailPoint.getData())) {
-                log() << "set pending kill on " << (c.curop()->parent() ? "nested" : "top-level")
-                      << " op " << c.curop()->opNum().get() << ", for checkForInterruptFail";
-                c.curop()->kill();
-            }
-        }
-
-        if (c.curop()->killPending()) {
-            return Status(ErrorCodes::Interrupted, "interrupted");
-        }
-
-        return Status::OK();
+    const auto killStatus = getKillStatus();
+    if (killStatus != ErrorCodes::OK) {
+        return Status(killStatus, "operation was interrupted");
     }
 
-    bool OperationContextImpl::isPrimaryFor( const StringData& ns ) {
-        return repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(
-                NamespaceString(ns).db());
-    }
+    return Status::OK();
+}
 
-    Transaction* OperationContextImpl::getTransaction() {
-        return _tx.setTxIdOnce((unsigned)getCurOp()->opNum());
-    }
+bool OperationContextImpl::isPrimaryFor(StringData ns) {
+    return repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(NamespaceString(ns));
+}
 
+void OperationContextImpl::setReplicatedWrites(bool writesAreReplicated) {
+    _writesAreReplicated = writesAreReplicated;
+}
+
+bool OperationContextImpl::writesAreReplicated() const {
+    return _writesAreReplicated;
+}
 }  // namespace mongo

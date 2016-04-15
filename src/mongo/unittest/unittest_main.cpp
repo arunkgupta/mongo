@@ -30,14 +30,12 @@
 #include <string>
 #include <vector>
 
-#include "base/initializer.h"
+#include "mongo/base/initializer.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/exception_filter_win32.h"
+#include "mongo/util/signal_handlers_synchronous.h"
 
-int main( int argc, char **argv, char **envp ) {
-    ::mongo::setWindowsUnhandledExceptionFilter();
+int main(int argc, char** argv, char** envp) {
+    ::mongo::setupSynchronousSignalHandlers();
     ::mongo::runGlobalInitializersOrDie(argc, argv, envp);
     return ::mongo::unittest::Suite::run(std::vector<std::string>(), "", 1);
 }
-
-void mongo::unittest::onCurrentTestNameChange( const std::string &testName ) {}

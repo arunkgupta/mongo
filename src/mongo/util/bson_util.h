@@ -29,26 +29,20 @@
 
 #pragma once
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 namespace mongo {
 
 template <typename T>
-void bsonArrToNumVector(BSONElement el, std::vector<T>& results){
+void bsonArrToNumVector(BSONElement el, std::vector<T>& results) {
+    if (el.type() == Array) {
+        std::vector<BSONElement> elements = el.Array();
 
-    if(el.type() == Array){
-
-	vector<BSONElement> elements = el.Array();
-
-        for(std::vector<BSONElement>::iterator i = elements.begin(); i != elements.end(); ++i){
-            results.push_back( (T) (*i).Number() );
+        for (std::vector<BSONElement>::iterator i = elements.begin(); i != elements.end(); ++i) {
+            results.push_back((T)(*i).Number());
         }
+    } else if (el.isNumber()) {
+        results.push_back((T)el.Number());
     }
-    else if(el.isNumber()){
-	results.push_back( (T) el.Number() );
-    }
-
 }
-
-
 }

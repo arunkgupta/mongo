@@ -26,105 +26,95 @@
  *    it in the license file.
  */
 
-#include "mongo/base/init.h"
+#include "mongo/platform/basic.h"
+
 #include "mongo/base/error_codes.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/client_basic.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
-#include "mongo/s/client_info.h"
-#include "mongo/s/config.h"
-#include "mongo/s/grid.h"
-#include "mongo/s/stale_exception.h"
 #include "mongo/s/strategy.h"
 
 namespace mongo {
 
-    using std::string;
-    using std::vector;
+using std::string;
+using std::stringstream;
+using std::vector;
 
-    /**
-     * Base class for mongos index filter commands.
-     * Cluster index filter commands don't do much more than
-     * forwarding the commands to all shards and combining the results.
-     */
-    class ClusterIndexFilterCmd : public Command {
+namespace {
+
+/**
+ * Base class for mongos index filter commands.
+ * Cluster index filter commands don't do much more than
+ * forwarding the commands to all shards and combining the results.
+ */
+class ClusterIndexFilterCmd : public Command {
     MONGO_DISALLOW_COPYING(ClusterIndexFilterCmd);
-    public:
 
-        virtual ~ClusterIndexFilterCmd() {
+public:
+    /**
+     * Instantiates a command that can be invoked by "name", which will be described by
+     * "helpText", and will require privilege "actionType" to run.
+     */
+    ClusterIndexFilterCmd(const std::string& name, const std::string& helpText)
+        : Command(name), _helpText(helpText) {}
+
+    virtual ~ClusterIndexFilterCmd() {}
+
+    bool slaveOk() const {
+        return false;
+    }
+
+    bool slaveOverrideOk() const {
+        return true;
+    }
+
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
+
+    void help(stringstream& ss) const {
+        ss << _helpText;
+    }
+
+    Status checkAuthForCommand(ClientBasic* client,
+                               const std::string& dbname,
+                               const BSONObj& cmdObj) {
+        AuthorizationSession* authzSession = AuthorizationSession::get(client);
+        ResourcePattern pattern = parseResourcePattern(dbname, cmdObj);
+
+        if (authzSession->isAuthorizedForActionsOnResource(pattern,
+                                                           ActionType::planCacheIndexFilter)) {
+            return Status::OK();
         }
 
-        bool slaveOk() const {
-            return false;
-        }
+        return Status(ErrorCodes::Unauthorized, "unauthorized");
+    }
 
-        virtual bool isWriteCommandForConfigServer() const { return false; }
-
-        void help(stringstream& ss) const {
-            ss << _helpText;
-        }
-
-        Status checkAuthForCommand( ClientBasic* client,
-                                    const std::string& dbname,
-                                    const BSONObj& cmdObj ) {
-            AuthorizationSession* authzSession = client->getAuthorizationSession();
-            ResourcePattern pattern = parseResourcePattern(dbname, cmdObj);
-    
-            if (authzSession->isAuthorizedForActionsOnResource(pattern,
-                                                               ActionType::planCacheIndexFilter)) {
-                return Status::OK();
-            }
-    
-            return Status(ErrorCodes::Unauthorized, "unauthorized");
-        }
-
-        // Cluster plan cache command entry point.
-        bool run(OperationContext* txn, const std::string& dbname,
-                  BSONObj& cmdObj,
-                  int options,
-                  std::string& errmsg,
-                  BSONObjBuilder& result,
-                  bool fromRepl );
-
-    public:
-
-        /**
-         * Instantiates a command that can be invoked by "name", which will be described by
-         * "helpText", and will require privilege "actionType" to run.
-         */
-        ClusterIndexFilterCmd( const std::string& name, const std::string& helpText) :
-            Command( name ), _helpText( helpText ) {
-        }
-
-    private:
-
-        std::string _helpText;
-    };
-
-    //
-    // Cluster index filter command implementation(s) below
-    //
-
-    bool ClusterIndexFilterCmd::run(OperationContext* txn, const std::string& dbName,
-                               BSONObj& cmdObj,
-                               int options,
-                               std::string& errMsg,
-                               BSONObjBuilder& result,
-                               bool ) {
-        const std::string fullns = parseNs(dbName, cmdObj);
-        NamespaceString nss(fullns);
+    // Cluster plan cache command entry point.
+    bool run(OperationContext* txn,
+             const std::string& dbname,
+             BSONObj& cmdObj,
+             int options,
+             std::string& errmsg,
+             BSONObjBuilder& result) {
+        const NamespaceString nss(parseNs(dbname, cmdObj));
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << nss.ns() << " is not a valid namespace",
+                nss.isValid());
 
         // Dispatch command to all the shards.
         // Targeted shard commands are generally data-dependent but index filter
         // commands are tied to query shape (data has no effect on query shape).
         vector<Strategy::CommandResult> results;
-        STRATEGY->commandOp(dbName, cmdObj, options, nss.ns(), BSONObj(), &results);
+        Strategy::commandOp(txn, dbname, cmdObj, options, nss.ns(), BSONObj(), &results);
 
         // Set value of first shard result's "ok" field.
         bool clusterCmdResult = true;
 
         for (vector<Strategy::CommandResult>::const_iterator i = results.begin();
-             i != results.end(); ++i) {
+             i != results.end();
+             ++i) {
             const Strategy::CommandResult& cmdResult = *i;
 
             // XXX: In absence of sensible aggregation strategy,
@@ -136,38 +126,28 @@ namespace mongo {
 
             // Append shard result as a sub object.
             // Name the field after the shard.
-            string shardName = cmdResult.shardTarget.getName();
-            result.append(shardName, cmdResult.result);
+            result.append(cmdResult.shardTargetId, cmdResult.result);
         }
 
         return clusterCmdResult;
     }
 
-    //
-    // Register index filter commands at startup
-    //
+private:
+    const std::string _helpText;
+};
 
-    namespace {
+// Register index filter commands at startup
+ClusterIndexFilterCmd clusterPlanCacheListFiltersCmd(
+    "planCacheListFilters", "Displays index filters for all query shapes in a collection.");
 
-        MONGO_INITIALIZER(RegisterIndexFilterCommands)(InitializerContext* context) {
-            // Leaked intentionally: a Command registers itself when constructed.
+ClusterIndexFilterCmd clusterPlanCacheClearFiltersCmd(
+    "planCacheClearFilters",
+    "Clears index filter for a single query shape or, "
+    "if the query shape is omitted, all filters for the collection.");
 
-            new ClusterIndexFilterCmd(
-                "planCacheListFilters",
-                "Displays index filters for all query shapes in a collection." );
+ClusterIndexFilterCmd clusterPlanCacheSetFilterCmd(
+    "planCacheSetFilter", "Sets index filter for a query shape. Overrides existing index filter.");
 
-            new ClusterIndexFilterCmd(
-                "planCacheClearFilters",
-                "Clears index filter for a single query shape or, "
-                "if the query shape is omitted, all filters for the collection." );
 
-            new ClusterIndexFilterCmd(
-                "planCacheSetFilter",
-                "Sets index filter for a query shape. Overrides existing index filter." );
-
-            return Status::OK();
-        }
-
-    } // namespace
-
-} // namespace mongo
+}  // namespace
+}  // namespace mongo

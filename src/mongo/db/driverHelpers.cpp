@@ -34,7 +34,7 @@
 */
 
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include <string>
 #include <vector>
@@ -50,32 +50,45 @@
 
 namespace mongo {
 
-    class BasicDriverHelper : public Command {
-    public:
-        BasicDriverHelper( const char * name ) : Command( name ) {}
+using std::string;
 
-        virtual bool isWriteCommandForConfigServer() const { return false; }
-        virtual bool slaveOk() const { return true; }
-        virtual bool slaveOverrideOk() const { return true; }
-    };
+class BasicDriverHelper : public Command {
+public:
+    BasicDriverHelper(const char* name) : Command(name) {}
 
-    class ObjectIdTest : public BasicDriverHelper {
-    public:
-        ObjectIdTest() : BasicDriverHelper( "driverOIDTest" ) {}
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {} // No auth required
-        virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            if ( cmdObj.firstElement().type() != jstOID ) {
-                errmsg = "not oid";
-                return false;
-            }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
+    virtual bool slaveOk() const {
+        return true;
+    }
+    virtual bool slaveOverrideOk() const {
+        return true;
+    }
+};
 
-            const OID& oid = cmdObj.firstElement().__oid();
-            result.append( "oid" , oid );
-            result.append( "str" , oid.str() );
-
-            return true;
+class ObjectIdTest : public BasicDriverHelper {
+public:
+    ObjectIdTest() : BasicDriverHelper("driverOIDTest") {}
+    virtual void addRequiredPrivileges(const std::string& dbname,
+                                       const BSONObj& cmdObj,
+                                       std::vector<Privilege>* out) {}  // No auth required
+    virtual bool run(OperationContext* txn,
+                     const string&,
+                     BSONObj& cmdObj,
+                     int,
+                     string& errmsg,
+                     BSONObjBuilder& result) {
+        if (cmdObj.firstElement().type() != jstOID) {
+            errmsg = "not oid";
+            return false;
         }
-    } driverObjectIdTest;
+
+        const OID& oid = cmdObj.firstElement().__oid();
+        result.append("oid", oid);
+        result.append("str", oid.toString());
+
+        return true;
+    }
+} driverObjectIdTest;
 }

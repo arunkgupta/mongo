@@ -29,47 +29,32 @@
 
 #pragma once
 
+#include "mongo/config.h"
 
 namespace mongo {
 
-#if defined(_DEBUG)
-    enum {DEBUG_BUILD = 1};
-    const bool debug=true;
+#if defined(MONGO_CONFIG_DEBUG_BUILD)
+const bool kDebugBuild = true;
 #else
-    enum {DEBUG_BUILD = 0};
-    const bool debug=false;
+const bool kDebugBuild = false;
 #endif
 
-#define MONGO_DEV if( DEBUG_BUILD )
+#define MONGO_DEV if (kDebugBuild)
 #define DEV MONGO_DEV
-
-#define MONGO_DEBUGGING if( 0 )
-#define DEBUGGING MONGO_DEBUGGING
 
 // The following declare one unique counter per enclosing function.
 // NOTE The implementation double-increments on a match, but we don't really care.
-#define MONGO_SOMETIMES( occasion, howOften ) for( static unsigned occasion = 0; ++occasion % howOften == 0; )
+#define MONGO_SOMETIMES(occasion, howOften) \
+    for (static unsigned occasion = 0; ++occasion % howOften == 0;)
 #define SOMETIMES MONGO_SOMETIMES
 
-#define MONGO_OCCASIONALLY SOMETIMES( occasionally, 16 )
+#define MONGO_OCCASIONALLY SOMETIMES(occasionally, 16)
 #define OCCASIONALLY MONGO_OCCASIONALLY
 
-#define MONGO_RARELY SOMETIMES( rarely, 128 )
+#define MONGO_RARELY SOMETIMES(rarely, 128)
 #define RARELY MONGO_RARELY
 
-#define MONGO_ONCE for( static bool undone = true; undone; undone = false )
+#define MONGO_ONCE for (static bool undone = true; undone; undone = false)
 #define ONCE MONGO_ONCE
 
-#if defined(_WIN32)
-    inline int strcasecmp(const char* s1, const char* s2) {return _stricmp(s1, s2);}
-#endif
-
-    // Sets SIGTRAP handler to launch GDB
-    // Noop unless on *NIX and compiled with _DEBUG
-    void setupSIGTRAPforGDB();
-
-    void mongo_breakpoint();
-    inline void breakpoint() {
-        mongo_breakpoint();
-    }
-} // namespace mongo
+}  // namespace mongo

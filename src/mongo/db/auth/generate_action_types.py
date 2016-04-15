@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 
 #    Copyright 2012 10gen Inc.
 #
@@ -66,12 +66,12 @@ headerFileTemplate = """// AUTO-GENERATED FILE DO NOT EDIT
 
 #pragma once
 
+#include <cstdint>
 #include <iosfwd>
 #include <map>
 #include <string>
 
 #include "mongo/base/status.h"
-#include "mongo/platform/cstdint.h"
 
 namespace mongo {
 
@@ -144,15 +144,15 @@ sourceFileTemplate = """// AUTO-GENERATED FILE DO NOT EDIT
  *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/action_type.h"
 
+#include <cstdint>
 #include <iostream>
 #include <string>
 
 #include "mongo/base/status.h"
-#include "mongo/platform/cstdint.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {

@@ -26,274 +26,238 @@
 *    it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/sync_source_feedback.h"
 
-#include "mongo/client/constants.h"
-#include "mongo/client/dbclientcursor.h"
-#include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/auth/authorization_manager_global.h"
-#include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/security_key.h"
-#include "mongo/db/dbhelpers.h"
-#include "mongo/db/repl/bgsync.h"
-#include "mongo/db/repl/rs.h"  // theReplSet
+#include "mongo/db/client.h"
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/db/repl/bgsync.h"
+#include "mongo/db/repl/replica_set_config.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/reporter.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/executor/network_interface_factory.h"
+#include "mongo/executor/network_interface_thread_pool.h"
+#include "mongo/executor/thread_pool_task_executor.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/stdx/memory.h"
+#include "mongo/util/exit.h"
 #include "mongo/util/log.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
-    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kReplication);
+using std::endl;
+using std::string;
 
 namespace repl {
 
-    // used in replAuthenticate
-    static const BSONObj userReplQuery = fromjson("{\"user\":\"repl\"}");
+namespace {
 
-    void SyncSourceFeedback::associateMember(const BSONObj& id, Member* member) {
-        invariant(member);
-        const OID rid = id["_id"].OID();
-        boost::unique_lock<boost::mutex> lock(_mtx);
-        _handshakeNeeded = true;
-        _members[rid] = member;
+/**
+ * Calculates the keep alive interval based on the current configuration in the replication
+ * coordinator.
+ */
+Milliseconds calculateKeepAliveInterval(OperationContext* txn, stdx::mutex& mtx) {
+    stdx::lock_guard<stdx::mutex> lock(mtx);
+    auto replCoord = repl::ReplicationCoordinator::get(txn);
+    auto rsConfig = replCoord->getConfig();
+    auto keepAliveInterval = rsConfig.getElectionTimeoutPeriod() / 2;
+    return keepAliveInterval;
+}
+
+/**
+ * Returns function to prepare update command
+ */
+Reporter::PrepareReplSetUpdatePositionCommandFn makePrepareReplSetUpdatePositionCommandFn(
+    OperationContext* txn, stdx::mutex& mtx, const HostAndPort& syncTarget) {
+    return [&mtx, syncTarget, txn](
+               ReplicationCoordinator::ReplSetUpdatePositionCommandStyle commandStyle)
+        -> StatusWith<BSONObj> {
+            auto currentSyncTarget = BackgroundSync::get()->getSyncTarget();
+            if (currentSyncTarget != syncTarget) {
+                // Change in sync target
+                return Status(ErrorCodes::InvalidSyncSource, "Sync target is no longer valid");
+            }
+
+            stdx::lock_guard<stdx::mutex> lock(mtx);
+            auto replCoord = repl::ReplicationCoordinator::get(txn);
+            if (replCoord->getMemberState().primary()) {
+                // Primary has no one to send updates to.
+                return Status(ErrorCodes::InvalidSyncSource,
+                              "Currently primary - no one to send updates to");
+            }
+
+            return replCoord->prepareReplSetUpdatePositionCommand(commandStyle);
+        };
+}
+
+}  // namespace
+
+void SyncSourceFeedback::forwardSlaveProgress() {
+    {
+        stdx::unique_lock<stdx::mutex> lock(_mtx);
+        _positionChanged = true;
         _cond.notify_all();
-    }
-
-    bool SyncSourceFeedback::replAuthenticate() {
-        if (!getGlobalAuthorizationManager()->isAuthEnabled())
-            return true;
-
-        if (!isInternalAuthSet())
-            return false;
-        return authenticateInternalUser(_connection.get());
-    }
-
-    void SyncSourceFeedback::ensureMe() {
-        string myname = getHostName();
-        {
-            OperationContextImpl txn;
-            Client::WriteContext ctx(&txn, "local");
-
-            // local.me is an identifier for a server for getLastError w:2+
-            if (!Helpers::getSingleton(&txn, "local.me", _me) ||
-                !_me.hasField("host") ||
-                _me["host"].String() != myname) {
-
-                // clean out local.me
-                Helpers::emptyCollection(&txn, "local.me");
-
-                // repopulate
-                BSONObjBuilder b;
-                b.appendOID("_id", 0, true);
-                b.append("host", myname);
-                _me = b.obj();
-                Helpers::putSingleton(&txn, "local.me", _me);
+        if (_reporter) {
+            auto triggerStatus = _reporter->trigger();
+            if (!triggerStatus.isOK()) {
+                warning() << "unable to forward slave progress to " << _reporter->getTarget()
+                          << ": " << triggerStatus;
             }
-            ctx.commit();
-            // _me is used outside of a read lock, so we must copy it out of the mmap
-            _me = _me.getOwned();
+        }
+    }
+}
+
+Status SyncSourceFeedback::_updateUpstream(OperationContext* txn) {
+    Reporter* reporter;
+    {
+        stdx::lock_guard<stdx::mutex> lock(_mtx);
+        reporter = _reporter;
+    }
+
+    auto syncTarget = reporter->getTarget();
+
+    auto triggerStatus = reporter->trigger();
+    if (!triggerStatus.isOK()) {
+        warning() << "unable to schedule reporter to update replication progress on " << syncTarget
+                  << ": " << triggerStatus;
+        return triggerStatus;
+    }
+
+    auto status = reporter->join();
+
+    if (!status.isOK()) {
+        log() << "SyncSourceFeedback error sending update to " << syncTarget << ": " << status;
+
+        // Some errors should not cause result in blacklisting the sync source.
+        if (status != ErrorCodes::InvalidSyncSource) {
+            // The command could not be created because the node is now primary.
+        } else if (status != ErrorCodes::NodeNotFound) {
+            // The command could not be created, likely because this node was removed from the set.
+        } else {
+            // Blacklist sync target for .5 seconds and find a new one.
+            stdx::lock_guard<stdx::mutex> lock(_mtx);
+            auto replCoord = repl::ReplicationCoordinator::get(txn);
+            replCoord->blacklistSyncSource(syncTarget, Date_t::now() + Milliseconds(500));
+            BackgroundSync::get()->clearSyncTarget();
         }
     }
 
-    bool SyncSourceFeedback::replHandshake() {
-        // construct a vector of handshake obj for us as well as all chained members
-        std::vector<BSONObj> handshakeObjs;
-        {
-            boost::unique_lock<boost::mutex> lock(_mtx);
-            // handshake obj for us
-            BSONObjBuilder cmd;
-            cmd.append("replSetUpdatePosition", 1);
-            BSONObjBuilder sub (cmd.subobjStart("handshake"));
-            sub.appendAs(_me["_id"], "handshake");
-            sub.append("member", theReplSet->selfId());
-            sub.append("config", theReplSet->myConfig().asBson());
-            sub.doneFast();
-            handshakeObjs.push_back(cmd.obj());
+    return status;
+}
 
-            // handshake objs for all chained members
-            for (OIDMemberMap::iterator itr = _members.begin();
-                 itr != _members.end(); ++itr) {
-                BSONObjBuilder cmd;
-                cmd.append("replSetUpdatePosition", 1);
-                // outer handshake indicates this is a handshake command
-                // inner is needed as part of the structure to be passed to gotHandshake
-                BSONObjBuilder subCmd (cmd.subobjStart("handshake"));
-                subCmd.append("handshake", itr->first);
-                subCmd.append("member", itr->second->id());
-                subCmd.append("config", itr->second->config().asBson());
-                subCmd.doneFast();
-                handshakeObjs.push_back(cmd.obj());
-            }
+void SyncSourceFeedback::shutdown() {
+    stdx::unique_lock<stdx::mutex> lock(_mtx);
+    if (_reporter) {
+        _reporter->shutdown();
+    }
+    _shutdownSignaled = true;
+    _cond.notify_all();
+}
+
+void SyncSourceFeedback::run() {
+    Client::initThread("SyncSourceFeedback");
+
+    // Task executor used to run replSetUpdatePosition command on sync source.
+    auto net = executor::makeNetworkInterface("NetworkInterfaceASIO-SyncSourceFeedback");
+    auto pool = stdx::make_unique<executor::NetworkInterfaceThreadPool>(net.get());
+    executor::ThreadPoolTaskExecutor executor(std::move(pool), std::move(net));
+    executor.startup();
+    ON_BLOCK_EXIT([&executor]() {
+        executor.shutdown();
+        executor.join();
+    });
+
+    HostAndPort syncTarget;
+
+    // keepAliveInterval indicates how frequently to forward progress in the absence of updates.
+    Milliseconds keepAliveInterval(0);
+
+    while (true) {  // breaks once _shutdownSignaled is true
+        auto txn = cc().makeOperationContext();
+
+        if (keepAliveInterval == Milliseconds(0)) {
+            keepAliveInterval = calculateKeepAliveInterval(txn.get(), _mtx);
         }
 
-        LOG(1) << "handshaking upstream updater";
-        for (std::vector<BSONObj>::iterator it = handshakeObjs.begin();
-                it != handshakeObjs.end();
-                ++it) {
-            BSONObj res;
-            try {
-                if (!_connection->runCommand("admin", *it, res)) {
-                    massert(17447, "upstream updater is not supported by the member from which we"
-                            " are syncing, please update all nodes to 2.6 or later.",
-                            res["errmsg"].str().find("no such cmd") == std::string::npos);
-                    log() << "replSet error while handshaking the upstream updater: "
-                        << res["errmsg"].valuestrsafe();
-
-                    _resetConnection();
-                    return false;
+        {
+            // Take SyncSourceFeedback lock before calling into ReplicationCoordinator
+            // to avoid deadlock because ReplicationCoordinator could conceivably calling back into
+            // this class.
+            stdx::unique_lock<stdx::mutex> lock(_mtx);
+            while (!_positionChanged && !_shutdownSignaled) {
+                if (_cond.wait_for(lock, keepAliveInterval) == stdx::cv_status::timeout) {
+                    MemberState state = ReplicationCoordinator::get(txn.get())->getMemberState();
+                    if (!(state.primary() || state.startup())) {
+                        break;
+                    }
                 }
             }
-            catch (const DBException& e) {
-                log() << "SyncSourceFeedback error sending handshake: " << e.what() << endl;
-                _resetConnection();
-                return false;
+
+            if (_shutdownSignaled) {
+                break;
             }
-        }
-        return true;
-    }
 
-    bool SyncSourceFeedback::_connect(const std::string& hostName) {
-        if (hasConnection()) {
-            return true;
-        }
-        log() << "replset setting syncSourceFeedback to " << hostName << rsLog;
-        _connection.reset(new DBClientConnection(false, 0, OplogReader::tcp_timeout));
-        string errmsg;
-        if (!_connection->connect(hostName.c_str(), errmsg) ||
-            (getGlobalAuthorizationManager()->isAuthEnabled() && !replAuthenticate())) {
-            _resetConnection();
-            log() << "repl: " << errmsg << endl;
-            return false;
+            _positionChanged = false;
         }
 
-        replHandshake();
-        return hasConnection();
-    }
-
-    void SyncSourceFeedback::forwardSlaveHandshake() {
-        boost::unique_lock<boost::mutex> lock(_mtx);
-        _handshakeNeeded = true;
-        _cond.notify_all();
-    }
-
-    void SyncSourceFeedback::updateMap(const mongo::OID& rid, const OpTime& ot) {
-        boost::unique_lock<boost::mutex> lock(_mtx);
-        // only update if ot is newer than what we have already
-        if (ot > _slaveMap[rid]) {
-            _slaveMap[rid] = ot;
-            _positionChanged = true;
-            LOG(2) << "now last is " << _slaveMap[rid].toString() << endl;
-            _cond.notify_all();
-        }
-    }
-
-    bool SyncSourceFeedback::updateUpstream() {
-        if (theReplSet->isPrimary()) {
-            // primary has no one to update to
-            return true;
-        }
-        BSONObjBuilder cmd;
-        cmd.append("replSetUpdatePosition", 1);
-        // create an array containing objects each member connected to us and for ourself
-        BSONArrayBuilder array (cmd.subarrayStart("optimes"));
-        OID myID = _me["_id"].OID();
         {
-            boost::unique_lock<boost::mutex> lock(_mtx);
-            for (map<mongo::OID, OpTime>::const_iterator itr = _slaveMap.begin();
-                    itr != _slaveMap.end(); ++itr) {
-                BSONObjBuilder entry(array.subobjStart());
-                entry.append("_id", itr->first);
-                entry.append("optime", itr->second);
-                if (itr->first == myID) {
-                    entry.append("config", theReplSet->myConfig().asBson());
-                }
-                else {
-                    entry.append("config", _members[itr->first]->config().asBson());
-                }
-                entry.doneFast();
-            }
-        }
-        array.done();
-        BSONObj res;
-
-        bool ok;
-        try {
-            ok = _connection->runCommand("admin", cmd.obj(), res);
-        }
-        catch (const DBException& e) {
-            log() << "SyncSourceFeedback error sending update: " << e.what() << endl;
-            _resetConnection();
-            return false;
-        }
-        if (!ok) {
-            log() << "SyncSourceFeedback error sending update, response: " << res.toString() <<endl;
-            _resetConnection();
-            return false;
-        }
-        return true;
-    }
-
-    void SyncSourceFeedback::run() {
-        Client::initThread("SyncSourceFeedbackThread");
-        bool sleepNeeded = false;
-        bool positionChanged = false;
-        bool handshakeNeeded = false;
-        while (!inShutdown()) {
-            if (!theReplSet) {
-                sleepsecs(5);
+            stdx::lock_guard<stdx::mutex> lock(_mtx);
+            MemberState state = ReplicationCoordinator::get(txn.get())->getMemberState();
+            if (state.primary() || state.startup()) {
                 continue;
             }
-            if (sleepNeeded) {
-                sleepmillis(500);
-                sleepNeeded = false;
-            }
-            {
-                boost::unique_lock<boost::mutex> lock(_mtx);
-                while (!_positionChanged && !_handshakeNeeded) {
-                    _cond.wait(lock);
-                }
-                positionChanged = _positionChanged;
-                handshakeNeeded = _handshakeNeeded;
-                _positionChanged = false;
-                _handshakeNeeded = false;
-            }
+        }
 
-            MemberState state = theReplSet->state();
-            if (state.primary() || state.fatal() || state.startup()) {
-                continue;
+        const HostAndPort target = BackgroundSync::get()->getSyncTarget();
+        // Log sync source changes.
+        if (target.empty()) {
+            if (syncTarget != target) {
+                syncTarget = target;
             }
-            const Member* target = BackgroundSync::get()->getSyncTarget();
-            if (_syncTarget != target) {
-                _resetConnection();
-                _syncTarget = target;
-            }
-            if (!hasConnection()) {
-                // fix connection if need be
-                if (!target) {
-                    sleepNeeded = true;
-                    continue;
-                }
-                if (!_connect(target->fullName())) {
-                    sleepNeeded = true;
-                    continue;
-                }
-            }
-            if (handshakeNeeded) {
-                if (!replHandshake()) {
-                    boost::unique_lock<boost::mutex> lock(_mtx);
-                    _handshakeNeeded = true;
-                    continue;
-                }
-            }
-            if (positionChanged) {
-                if (!updateUpstream()) {
-                    boost::unique_lock<boost::mutex> lock(_mtx);
-                    _positionChanged = true;
-                }
+            // Loop back around again; the keepalive functionality will cause us to retry
+            continue;
+        }
+
+        if (syncTarget != target) {
+            LOG(1) << "setting syncSourceFeedback to " << target;
+            syncTarget = target;
+
+            // Update keepalive value from config.
+            auto oldKeepAliveInterval = keepAliveInterval;
+            keepAliveInterval = calculateKeepAliveInterval(txn.get(), _mtx);
+            if (oldKeepAliveInterval != keepAliveInterval) {
+                LOG(1) << "new syncSourceFeedback keep alive duration = " << keepAliveInterval
+                       << " (previously " << oldKeepAliveInterval << ")";
             }
         }
-        cc().shutdown();
+
+        Reporter reporter(&executor,
+                          makePrepareReplSetUpdatePositionCommandFn(txn.get(), _mtx, syncTarget),
+                          syncTarget,
+                          keepAliveInterval);
+        {
+            stdx::lock_guard<stdx::mutex> lock(_mtx);
+            _reporter = &reporter;
+        }
+        ON_BLOCK_EXIT([this]() {
+            stdx::lock_guard<stdx::mutex> lock(_mtx);
+            _reporter = nullptr;
+        });
+
+        auto status = _updateUpstream(txn.get());
+        if (!status.isOK()) {
+            LOG(1) << "The replication progress command (replSetUpdatePosition) failed and will be "
+                      "retried: " << status;
+        }
     }
-} // namespace repl
-} // namespace mongo
+}
+
+}  // namespace repl
+}  // namespace mongo

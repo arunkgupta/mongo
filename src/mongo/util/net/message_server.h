@@ -34,48 +34,48 @@
 
 #pragma once
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 namespace mongo {
 
-    struct LastError;
+class MessageHandler {
+public:
+    virtual ~MessageHandler() {}
 
-    class MessageHandler {
-    public:
-        virtual ~MessageHandler() {}
-        
-        /**
-         * called once when a socket is connected
-         */
-        virtual void connected( AbstractMessagingPort* p ) = 0;
+    /**
+     * Called once when a socket is connected.
+     */
+    virtual void connected(AbstractMessagingPort* p) = 0;
 
-        /**
-         * called every time a message comes in
-         * handler is responsible for responding to client
-         */
-        virtual void process( Message& m , AbstractMessagingPort* p , LastError * err ) = 0;
+    /**
+     * Called every time a message comes in. Handler is responsible for responding to client.
+     */
+    virtual void process(Message& m, AbstractMessagingPort* p) = 0;
 
-        /**
-         * called once when a socket is disconnected
-         */
-        virtual void disconnected( AbstractMessagingPort* p ) = 0;
+    /**
+     * Called once, either when the client disconnects or when the process is shutting down. After
+     * close() is called, this handler's AbstractMessagingPort pointer (passed in via the
+     * connected() method) is no longer valid.
+     */
+    virtual void close() = 0;
+};
+
+class MessageServer {
+public:
+    struct Options {
+        int port;            // port to bind to
+        std::string ipList;  // addresses to bind to
+
+        Options() : port(0), ipList("") {}
     };
 
-    class MessageServer {
-    public:
-        struct Options {
-            int port;                   // port to bind to
-            std::string ipList;             // addresses to bind to
+    virtual ~MessageServer() {}
+    virtual void run() = 0;
+    virtual void setAsTimeTracker() = 0;
+    virtual bool setupSockets() = 0;
+};
 
-            Options() : port(0), ipList("") {}
-        };
-
-        virtual ~MessageServer() {}
-        virtual void run() = 0;
-        virtual void setAsTimeTracker() = 0;
-        virtual void setupSockets() = 0;
-    };
-
-    // TODO use a factory here to decide between port and asio variations
-    MessageServer * createServer( const MessageServer::Options& opts , MessageHandler * handler );
+// TODO use a factory here to decide between port and asio variations
+MessageServer* createServer(const MessageServer::Options& opts,
+                            std::shared_ptr<MessageHandler> handler);
 }

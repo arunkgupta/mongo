@@ -30,51 +30,42 @@
 
 #include "mongo/db/matcher/expression.h"
 
-#include "mongo/bson/bsonobjiterator.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonmisc.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
-    MatchExpression::MatchExpression( MatchType type )
-        : _matchType( type ) { }
+using std::string;
 
-    string MatchExpression::toString() const {
-        StringBuilder buf;
-        debugString( buf, 0 );
-        return buf.str();
-    }
+MatchExpression::MatchExpression(MatchType type) : _matchType(type) {}
 
-    void MatchExpression::_debugAddSpace( StringBuilder& debug, int level ) const {
-        for ( int i = 0; i < level; i++ )
-            debug << "    ";
-    }
-
-    bool MatchExpression::matchesBSON( const BSONObj& doc, MatchDetails* details ) const {
-        BSONMatchableDocument mydoc( doc );
-        return matches( &mydoc, details );
-    }
-
-
-    void AtomicMatchExpression::debugString( StringBuilder& debug, int level ) const {
-        _debugAddSpace( debug, level );
-        debug << "$atomic\n";
-    }
-
-    void AtomicMatchExpression::toBSON(BSONObjBuilder* out) const {
-        out->append("$isolated", 1);
-    }
-
-    void FalseMatchExpression::debugString( StringBuilder& debug, int level ) const {
-        _debugAddSpace( debug, level );
-        debug << "$false\n";
-    }
-
-    void FalseMatchExpression::toBSON(BSONObjBuilder* out) const {
-        out->append("$false", 1);
-    }
-
+string MatchExpression::toString() const {
+    StringBuilder buf;
+    debugString(buf, 0);
+    return buf.str();
 }
 
+void MatchExpression::_debugAddSpace(StringBuilder& debug, int level) const {
+    for (int i = 0; i < level; i++)
+        debug << "    ";
+}
 
+bool MatchExpression::matchesBSON(const BSONObj& doc, MatchDetails* details) const {
+    BSONMatchableDocument mydoc(doc);
+    return matches(&mydoc, details);
+}
+
+void FalseMatchExpression::debugString(StringBuilder& debug, int level) const {
+    _debugAddSpace(debug, level);
+    debug << "$all: []\n";
+}
+
+void FalseMatchExpression::serialize(BSONObjBuilder* out) const {
+    // Our query language has no "always false" operator aside from a $all with no children, so use
+    // that as a proxy here.
+    BSONObjBuilder child(out->subobjStart(_path));
+    BSONArrayBuilder allChild(child.subarrayStart("$all"));
+    allChild.doneFast();
+    child.doneFast();
+}
+}

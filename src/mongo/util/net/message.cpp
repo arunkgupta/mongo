@@ -27,7 +27,7 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/util/net/message.h"
 
@@ -35,40 +35,38 @@
 #include <errno.h>
 #include <time.h>
 
-#include "mongo/util/goodies.h"
 #include "mongo/util/net/listen.h"
 #include "mongo/util/net/message_port.h"
 
 namespace mongo {
 
-    void Message::send( MessagingPort &p, const char *context ) {
-        if ( empty() ) {
-            return;
-        }
-        if ( _buf != 0 ) {
-            p.send( (char*)_buf, _buf->len, context );
-        }
-        else {
-            p.send( _data, context );
-        }
+void Message::send(MessagingPort& p, const char* context) {
+    if (empty()) {
+        return;
     }
-
-    AtomicWord<MSGID> NextMsgId;
-
-    /*struct MsgStart {
-        MsgStart() {
-            NextMsgId = (((unsigned) time(0)) << 16) ^ curTimeMillis();
-            verify(MsgDataHeaderSize == 16);
-        }
-    } msgstart;*/
-
-    MSGID nextMessageId() {
-        return NextMsgId.fetchAndAdd(1);
+    if (_buf != 0) {
+        p.send(_buf, MsgData::ConstView(_buf).getLen(), context);
+    } else {
+        p.send(_data, context);
     }
+}
 
-    bool doesOpGetAResponse( int op ) {
-        return op == dbQuery || op == dbGetMore;
+AtomicWord<int32_t> NextMsgId;
+
+/*struct MsgStart {
+    MsgStart() {
+        NextMsgId = (((unsigned) time(0)) << 16) ^ curTimeMillis();
+        verify(MsgDataHeaderSize == 16);
     }
+} msgstart;*/
+
+int32_t nextMessageId() {
+    return NextMsgId.fetchAndAdd(1);
+}
+
+bool doesOpGetAResponse(int op) {
+    return op == dbQuery || op == dbGetMore;
+}
 
 
-} // namespace mongo
+}  // namespace mongo

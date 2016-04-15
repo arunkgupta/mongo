@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 
 '''Helper script for constructing an archive (zip or tar) from a list of files.
 
@@ -29,12 +29,24 @@ For a detailed usage example, see src/SConscript.client or src/mongo/SConscript.
 import optparse
 import os
 import sys
+import shlex
 import shutil
 import zipfile
+import tempfile
 from subprocess import (Popen, PIPE, STDOUT)
 
 def main(argv):
-    opts = parse_options(argv[1:])
+    args = []
+    for arg in argv[1:]:
+        if arg.startswith("@"):
+            file_name = arg[1:]
+            f_handle = open(file_name, "r")
+            args.extend(s1.strip('"') for s1 in shlex.split(f_handle.readline(), posix=False))
+            f_handle.close()
+        else:
+            args.append(arg)
+
+    opts = parse_options(args)
     if opts.archive_format in ('tar', 'tgz'):
         make_tar_archive(opts)
     elif opts.archive_format in ('zip'):
@@ -69,9 +81,10 @@ def make_tar_archive(opts):
         tar_options += "z"
 
     # clean and create a temp directory to copy files to
-    enclosing_archive_directory = os.path.join("build", "archive")
-    delete_directory(enclosing_archive_directory)
-    os.makedirs(enclosing_archive_directory)
+    enclosing_archive_directory = tempfile.mkdtemp(
+        prefix='archive_',
+        dir=os.path.abspath('build')
+    )
     output_tarfile = os.path.join(os.getcwd(), opts.output_filename)
 
     tar_command = ["tar", tar_options, output_tarfile]
@@ -83,7 +96,10 @@ def make_tar_archive(opts):
         if not os.path.exists(enclosing_file_directory):
             os.makedirs(enclosing_file_directory)
         print "copying %s => %s" % (input_filename, temp_file_location)
-        shutil.copy2(input_filename, temp_file_location)
+        if os.path.isdir(input_filename):
+            shutil.copytree(input_filename, temp_file_location)
+        else:
+            shutil.copy2(input_filename, temp_file_location)
         tar_command.append(preferred_filename)
 
     print " ".join(tar_command)
@@ -170,7 +186,9 @@ def get_preferred_filename(input_filename, transformations):
     returns the substituted string
     '''
     for match, replace in transformations:
-        if input_filename.startswith(match):
+        match_lower = match.lower()
+        input_filename_lower = input_filename.lower()
+        if input_filename_lower.startswith(match_lower):
             return replace + input_filename[len(match):]
     return input_filename
 

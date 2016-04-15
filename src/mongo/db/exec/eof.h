@@ -28,37 +28,33 @@
 
 #pragma once
 
-#include "mongo/db/diskloc.h"
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/record_id.h"
 
 namespace mongo {
 
-    /**
-     * This stage just returns EOF immediately.
-     */
-    class EOFStage : public PlanStage {
-    public:
-        EOFStage();
+/**
+ * This stage just returns EOF immediately.
+ */
+class EOFStage final : public PlanStage {
+public:
+    EOFStage(OperationContext* opCtx);
 
-        virtual ~EOFStage();
+    ~EOFStage();
 
-        virtual bool isEOF();
-        virtual StageState work(WorkingSetID* out);
+    bool isEOF() final;
+    StageState doWork(WorkingSetID* out) final;
 
-        virtual void prepareToYield();
-        virtual void recoverFromYield();
-        virtual void invalidate(const DiskLoc& dl, InvalidationType type);
 
-        virtual std::vector<PlanStage*> getChildren() const;
+    StageType stageType() const final {
+        return STAGE_EOF;
+    }
 
-        virtual StageType stageType() const { return STAGE_EOF; }
+    std::unique_ptr<PlanStageStats> getStats();
 
-        PlanStageStats* getStats();
+    const SpecificStats* getSpecificStats() const final;
 
-        static const char* kStageType;
-
-    private:
-        CommonStats _commonStats;
-    };
+    static const char* kStageType;
+};
 
 }  // namespace mongo
